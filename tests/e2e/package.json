@@ -1,0 +1,38 @@
+{
+    "name": "e2e",
+    "version": "3.3.3",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "build": "pnpm test:generate && pnpm test:typecheck",
+        "test:generate": "tsx ../../scripts/test-generate.ts .",
+        "test:typecheck": "tsc --noEmit",
+        "test": "vitest run",
+        "test:sqlite": "TEST_DB_PROVIDER=sqlite vitest run",
+        "test:postgresql": "TEST_DB_PROVIDER=postgresql vitest run",
+        "test:mysql": "TEST_DB_PROVIDER=mysql vitest run"
+    },
+    "dependencies": {
+        "@paralleldrive/cuid2": "^2.2.2",
+        "@zenstackhq/cli": "workspace:*",
+        "@zenstackhq/language": "workspace:*",
+        "@zenstackhq/orm": "workspace:*",
+        "@zenstackhq/plugin-policy": "workspace:*",
+        "@zenstackhq/schema": "workspace:*",
+        "@zenstackhq/sdk": "workspace:*",
+        "@zenstackhq/testtools": "workspace:*",
+        "better-sqlite3": "catalog:",
+        "decimal.js": "catalog:",
+        "kysely": "catalog:",
+        "ulid": "^3.0.0",
+        "uuid": "^11.0.5",
+        "cuid": "^3.0.0",
+        "zod": "catalog:",
+        "ts-pattern": "catalog:"
+    },
+    "devDependencies": {
+        "@zenstackhq/cli": "workspace:*",
+        "@zenstackhq/typescript-config": "workspace:*",
+        "@zenstackhq/vitest-config": "workspace:*"
+    }
+}

@@ -1,0 +1,112 @@
+## V3 Alpha Todo
+
+- [ ] CLI
+    - [x] generate
+    - [x] migrate
+    - [x] db
+        - [x] push
+        - [x] seed
+    - [x] info
+    - [x] init
+    - [x] validate
+    - [x] format
+    - [ ] repl
+    - [x] plugin mechanism
+    - [x] built-in plugins
+        - [x] typescript
+        - [x] prisma
+- [ ] ZModel
+    - [x] Import
+    - [ ] View support
+- [ ] ORM
+    - [x] Create
+        - [x] Input validation
+        - [x] Simple create
+        - [x] Nested create
+        - [x] Relation connection
+        - [x] Create many
+        - [x] ID generation
+        - [x] CreateManyAndReturn
+    - [x] Find
+        - [x] Input validation
+        - [x] Field selection
+            - [x] Omit
+            - [x] Counting relation
+        - [x] Pagination
+            - [x] Skip and limit
+            - [x] Cursor
+        - [ ] Filtering
+            - [x] Unique fields
+            - [x] Scalar fields
+            - [x] Relation fields
+            - [x] JSON filtering
+            - [ ] Full-text search
+        - [x] Sort
+            - [x] Scalar fields
+            - [x] Relation fields
+        - [x] Relation inclusion
+            - [x] Filtering
+            - [x] Sorting
+            - [x] Pagination
+        - [x] Distinct
+    - [x] Update
+        - [x] Input validation
+        - [x] Top-level
+        - [x] Nested to-many
+        - [x] Nested to-one
+        - [x] Incremental update for numeric fields
+        - [x] Array update
+        - [x] Strict typing for checked/unchecked input
+    - [x] Upsert
+    - [x] Delete
+    - [x] Aggregation
+        - [x] Count
+        - [x] Aggregate
+        - [x] Group by
+    - [x] Raw queries
+    - [x] Transactions
+        - [x] Interactive transaction
+        - [x] Sequential transaction
+    - [ ] Extensibility
+        - [x] Query builder API
+        - [x] Computed fields
+        - [x] Plugin
+        - [x] Custom procedures
+    - [ ] Misc
+        - [x] JSDoc for CRUD methods
+        - [x] Cache validation schemas
+        - [x] Compound ID
+        - [x] Many-to-many relation
+        - [x] Self relation
+        - [ ] Empty AND/OR/NOT behavior
+        - [x] Logging
+        - [x] Error system
+        - [x] Custom table name
+        - [x] Custom field name
+        - [x] Global omit
+        - [x] DbNull vs JsonNull
+        - [ ] Migrate to tsdown
+        - [x] @default validation
+    - [x] Benchmark
+- [x] Plugin
+    - [x] Post-mutation hooks should be called after transaction is committed
+- [x] TypeDef and mixin
+- [x] Strongly typed JSON
+- [x] Polymorphism
+    - [x] ZModel
+    - [x] Runtime
+    - [x] Typing
+- [x] Validation
+- [ ] Access Policy
+    - [ ] Short-circuit pre-create check for scalar-field only policies
+    - [x] Field-level policies
+    - [x] Inject "on conflict do update"
+    - [x] `check` function
+    - [ ] Custom functions
+    - [x] Accessing tables not in the schema
+- [x] Migration
+- [ ] Databases
+    - [x] SQLite
+    - [x] PostgreSQL
+        - [x] Multi-schema
+    - [x] MySQL

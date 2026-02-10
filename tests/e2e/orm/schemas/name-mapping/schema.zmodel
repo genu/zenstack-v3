@@ -1,0 +1,27 @@
+datasource db {
+    provider = "sqlite"
+    url      = "file:./dev.db"
+}
+
+enum Role {
+    USER @map('role_user')
+    ADMIN @map('role_admin')
+    MODERATOR
+    @@map("user_role")
+}
+
+model User {
+    id    Int    @id @default(autoincrement()) @map('user_id')
+    email String @map('user_email') @unique
+    role  Role   @default(USER) @map('user_role')
+    posts Post[]
+    @@map('users')
+}
+
+model Post {
+    id       Int    @id @default(autoincrement()) @map('post_id')
+    title    String @map('post_title')
+    author   User   @relation(fields: [authorId], references: [id])
+    authorId Int    @map('author_id')
+    @@map('posts')
+}

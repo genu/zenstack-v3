@@ -1,11 +1,5 @@
-export * from './code-gen';
-export * from './constants';
-export { generate as generateModelMeta } from './model-meta-generator';
-export * from './names';
-export * from './path';
-export * from './policy';
-export * from './types';
-export * from './typescript-expression-transformer';
-export * from './utils';
-export * from './validation';
-export * from './zmodel-code-generator';
+import * as ModelUtils from './model-utils';
+export * from './cli-plugin';
+export { PrismaSchemaGenerator } from './prisma/prisma-schema-generator';
+export * from './ts-schema-generator';
+export { ModelUtils };

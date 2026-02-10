@@ -1,29 +1,33 @@
-/* eslint-disable @typescript-eslint/no-explicit-any */
-import type { ModelMeta, ZodSchemas } from '@zenstackhq/runtime';
-import {
-    CrudFailureReason,
-    DbClientContract,
-    FieldInfo,
-    PrismaErrorCode,
-    clone,
-    enumerate,
-    getIdFields,
-    isPrismaClientKnownRequestError,
-    requireField,
-} from '@zenstackhq/runtime';
-import { getZodErrorMessage, lowerCaseFirst, paramCase, upperCaseFirst } from '@zenstackhq/runtime/local-helpers';
+import { clone, enumerate, lowerCaseFirst, paramCase } from '@zenstackhq/common-helpers';
+import { ORMError, ORMErrorReason, type ClientContract } from '@zenstackhq/orm';
+import type { FieldDef, ModelDef, SchemaDef } from '@zenstackhq/orm/schema';
+import { Decimal } from 'decimal.js';
 import SuperJSON from 'superjson';
-import { Linker, Paginator, Relator, Serializer, SerializerOptions } from 'ts-japi';
+import tsjapi, { type Linker, type Paginator, type Relator, type Serializer, type SerializerOptions } from 'ts-japi';
+import { match } from 'ts-pattern';
 import UrlPattern from 'url-pattern';
-import z, { ZodError } from 'zod';
-import { LoggerConfig, Response } from '../../types';
-import { APIHandlerBase, RequestContext } from '../base';
-import { logWarning, registerCustomSerializers } from '../utils';
+import z from 'zod';
+import { fromError } from 'zod-validation-error/v4';
+import type { ApiHandler, LogConfig, RequestContext, Response } from '../../types';
+import { getProcedureDef, mapProcedureArgs } from '../common/procedures';
+import { loggerSchema } from '../common/schemas';
+import { processSuperJsonRequestPayload } from '../common/utils';
+import { getZodErrorMessage, log, registerCustomSerializers } from '../utils';
 
 /**
- * Request handler options
+ * Options for {@link RestApiHandler}
  */
-export type Options = {
+export type RestApiHandlerOptions<Schema extends SchemaDef = SchemaDef> = {
+    /**
+     * The schema
+     */
+    schema: Schema;
+
+    /**
+     * Logging configuration
+     */
+    log?: LogConfig;
+
     /**
      * The base endpoint of the RESTful API, must be a valid URL
      */
@@ -32,7 +36,7 @@ export type Options = {
     /**
      * The default page size for limiting the number of results returned
      * from collection queries, including resource collection, related data
-     * of collection types, and relashionship of collection types.
+     * of collection types, and relationship of collection types.
      *
      * Defaults to 100. Set to Infinity to disable pagination.
      */
@@ -51,21 +55,28 @@ export type Options = {
      */
     urlSegmentCharset?: string;
 
+    /**
+     * Mapping from model names to URL segment names.
+     */
     modelNameMapping?: Record<string, string>;
 
+    /**
+     * Mapping from model names to unique field name to be used as resource's ID.
+     */
     externalIdMapping?: Record<string, string>;
 };
 
 type RelationshipInfo = {
     type: string;
-    idFields: FieldInfo[];
+    idFields: FieldDef[];
     isCollection: boolean;
     isOptional: boolean;
 };
 
 type ModelInfo = {
-    idFields: FieldInfo[];
-    fields: Record<string, FieldInfo>;
+    name: string;
+    idFields: FieldDef[];
+    fields: Record<string, FieldDef>;
     relationships: Record<string, RelationshipInfo>;
 };
 
@@ -83,7 +94,7 @@ enum UrlPatterns {
 }
 
 class InvalidValueError extends Error {
-    constructor(public readonly message: string) {
+    constructor(message: string) {
         super(message);
     }
 }
@@ -95,6 +106,7 @@ const FilterOperations = [
     'lte',
     'gt',
     'gte',
+    'between',
     'contains',
     'icontains',
     'search',
@@ -108,16 +120,16 @@ const FilterOperations = [
 
 type FilterOperationType = (typeof FilterOperations)[number] | undefined;
 
-const prismaIdDivider = '_';
+const DEFAULT_ID_DIVIDER = '_';
 
 registerCustomSerializers();
 
 /**
  * RESTful-style API request handler (compliant with JSON:API)
  */
-class RequestHandler extends APIHandlerBase {
+export class RestApiHandler<Schema extends SchemaDef = SchemaDef> implements ApiHandler<Schema> {
     // resource serializers
-    private serializers: Map<string, Serializer>;
+    private serializers = new Map<string, Serializer>();
 
     // error responses
     private readonly errors: Record<string, { status: number; title: string; detail?: string }> = {
@@ -157,12 +169,12 @@ class RequestHandler extends APIHandlerBase {
         },
         invalidRelationData: {
             status: 400,
-            title: 'Invalid payload',
+            title: 'Invalid relation data',
             detail: 'Invalid relationship data',
         },
         invalidRelation: {
             status: 400,
-            title: 'Invalid payload',
+            title: 'Invalid relation',
             detail: 'Invalid relationship',
         },
         invalidFilter: {
@@ -189,9 +201,12 @@ class RequestHandler extends APIHandlerBase {
             status: 422,
             title: 'Operation is unprocessable due to validation errors',
         },
-
-        unknownError: {
+        queryError: {
             status: 400,
+            title: 'Error occurred while executing the query',
+        },
+        unknownError: {
+            status: 500,
             title: 'Unknown error',
         },
     };
@@ -212,7 +227,7 @@ class RequestHandler extends APIHandlerBase {
                                 z.object({ type: z.string(), id: z.union([z.string(), z.number()]) }),
                                 z.array(z.object({ type: z.string(), id: z.union([z.string(), z.number()]) })),
                             ]),
-                        })
+                        }),
                     )
                     .optional(),
             }),
@@ -238,7 +253,7 @@ class RequestHandler extends APIHandlerBase {
     });
 
     // all known types and their metadata
-    private typeMap: Record<string, ModelInfo>;
+    private typeMap: Record<string, ModelInfo> = {};
 
     // divider used to separate compound ID fields
     private idDivider;
@@ -248,25 +263,54 @@ class RequestHandler extends APIHandlerBase {
     private reverseModelNameMapping: Record<string, string>;
     private externalIdMapping: Record<string, string>;
 
-    constructor(private readonly options: Options) {
-        super();
-        this.idDivider = options.idDivider ?? prismaIdDivider;
+    constructor(private readonly options: RestApiHandlerOptions<Schema>) {
+        this.validateOptions(options);
+
+        this.idDivider = options.idDivider ?? DEFAULT_ID_DIVIDER;
         const segmentCharset = options.urlSegmentCharset ?? 'a-zA-Z0-9-_~ %';
 
         this.modelNameMapping = options.modelNameMapping ?? {};
         this.modelNameMapping = Object.fromEntries(
-            Object.entries(this.modelNameMapping).map(([k, v]) => [lowerCaseFirst(k), v])
+            Object.entries(this.modelNameMapping).map(([k, v]) => [lowerCaseFirst(k), v]),
         );
         this.reverseModelNameMapping = Object.fromEntries(
-            Object.entries(this.modelNameMapping).map(([k, v]) => [v, k])
+            Object.entries(this.modelNameMapping).map(([k, v]) => [v, k]),
         );
 
         this.externalIdMapping = options.externalIdMapping ?? {};
         this.externalIdMapping = Object.fromEntries(
-            Object.entries(this.externalIdMapping).map(([k, v]) => [lowerCaseFirst(k), v])
+            Object.entries(this.externalIdMapping).map(([k, v]) => [lowerCaseFirst(k), v]),
         );
 
         this.urlPatternMap = this.buildUrlPatternMap(segmentCharset);
+
+        this.buildTypeMap();
+        this.buildSerializers();
+    }
+
+    private validateOptions(options: RestApiHandlerOptions<Schema>) {
+        const schema = z.strictObject({
+            schema: z.object(),
+            log: loggerSchema.optional(),
+            endpoint: z.string().min(1),
+            pageSize: z.union([z.number().int().positive(), z.literal(Infinity)]).optional(),
+            idDivider: z.string().min(1).optional(),
+            urlSegmentCharset: z.string().min(1).optional(),
+            modelNameMapping: z.record(z.string(), z.string()).optional(),
+            externalIdMapping: z.record(z.string(), z.string()).optional(),
+        });
+        const parseResult = schema.safeParse(options);
+        if (!parseResult.success) {
+            throw new Error(`Invalid options: ${fromError(parseResult.error)}`);
+        }
+    }
+
+    get schema() {
+        return this.options.schema;
+    }
+
+    get log(): LogConfig | undefined {
+        return this.options.log;
     }
 
     private buildUrlPatternMap(urlSegmentNameCharset: string): Record<UrlPatterns, UrlPattern> {
@@ -281,7 +325,7 @@ class RequestHandler extends APIHandlerBase {
             [UrlPatterns.FETCH_RELATIONSHIP]: new UrlPattern(buildPath([':type', ':id', ':relationship']), options),
             [UrlPatterns.RELATIONSHIP]: new UrlPattern(
                 buildPath([':type', ':id', 'relationships', ':relationship']),
-                options
+                options,
             ),
             [UrlPatterns.COLLECTION]: new UrlPattern(buildPath([':type']), options),
         };
@@ -304,7 +348,7 @@ class RequestHandler extends APIHandlerBase {
 
         if (match.type in this.modelNameMapping) {
             throw new InvalidValueError(
-                `use the mapped model name: ${this.modelNameMapping[match.type]} and not ${match.type}`
+                `use the mapped model name: ${this.modelNameMapping[match.type]} and not ${match.type}`,
             );
         }
 
@@ -315,64 +359,47 @@ class RequestHandler extends APIHandlerBase {
         return match;
     }
 
-    async handleRequest({
-        prisma,
-        method,
-        path,
-        query,
-        requestBody,
-        logger,
-        modelMeta,
-        zodSchemas,
-    }: RequestContext): Promise<Response> {
-        modelMeta = modelMeta ?? this.defaultModelMeta;
-        if (!modelMeta) {
-            throw new Error('Model metadata is not provided or loaded from default location');
-        }
-
-        if (!this.serializers) {
-            this.buildSerializers(modelMeta);
-        }
-
-        if (!this.typeMap) {
-            this.buildTypeMap(logger, modelMeta);
-        }
-
+    async handleRequest({ client, method, path, query, requestBody }: RequestContext<Schema>): Promise<Response> {
         method = method.toUpperCase();
         if (!path.startsWith('/')) {
             path = '/' + path;
         }
 
         try {
+            if (path.startsWith('/$procs/')) {
+                const proc = path.split('/')[2];
+                return await this.processProcedureRequest({ client, method, proc, query, requestBody });
+            }
+
             switch (method) {
                 case 'GET': {
                     let match = this.matchUrlPattern(path, UrlPatterns.SINGLE);
                     if (match) {
                         // single resource read
-                        return await this.processSingleRead(prisma, match.type, match.id, query);
+                        return await this.processSingleRead(client, match.type, match.id, query);
                     }
                     match = this.matchUrlPattern(path, UrlPatterns.FETCH_RELATIONSHIP);
                     if (match) {
                         // fetch related resource(s)
-                        return await this.processFetchRelated(prisma, match.type, match.id, match.relationship, query);
+                        return await this.processFetchRelated(client, match.type, match.id, match.relationship, query);
                     }
 
                     match = this.matchUrlPattern(path, UrlPatterns.RELATIONSHIP);
                     if (match) {
                         // read relationship
                         return await this.processReadRelationship(
-                            prisma,
+                            client,
                             match.type,
                             match.id,
                             match.relationship,
-                            query
+                            query,
                         );
                     }
 
                     match = this.matchUrlPattern(path, UrlPatterns.COLLECTION);
                     if (match) {
                         // collection read
-                        return await this.processCollectionRead(prisma, match.type, query);
+                        return await this.processCollectionRead(client, match.type, query);
                     }
 
                     return this.makeError('invalidPath');
@@ -388,37 +415,23 @@ class RequestHandler extends APIHandlerBase {
                         const upsertMeta = this.upsertMetaSchema.safeParse(body);
                         if (upsertMeta.success) {
                             // resource upsert
-                            return await this.processUpsert(
-                                prisma,
-                                match.type,
-                                query,
-                                requestBody,
-                                modelMeta,
-                                zodSchemas
-                            );
+                            return await this.processUpsert(client, match.type, query, requestBody);
                         } else {
                             // resource creation
-                            return await this.processCreate(
-                                prisma,
-                                match.type,
-                                query,
-                                requestBody,
-                                modelMeta,
-                                zodSchemas
-                            );
+                            return await this.processCreate(client, match.type, query, requestBody);
                         }
                     }
                     match = this.matchUrlPattern(path, UrlPatterns.RELATIONSHIP);
                     if (match) {
                         // relationship creation (collection relationship only)
                         return await this.processRelationshipCRUD(
-                            prisma,
+                            client,
                             'create',
                             match.type,
                             match.id,
                             match.relationship,
                             query,
-                            requestBody
+                            requestBody,
                         );
                     }
 
@@ -434,27 +447,19 @@ class RequestHandler extends APIHandlerBase {
                     let match = this.matchUrlPattern(path, UrlPatterns.SINGLE);
                     if (match) {
                         // resource update
-                        return await this.processUpdate(
-                            prisma,
-                            match.type,
-                            match.id,
-                            query,
-                            requestBody,
-                            modelMeta,
-                            zodSchemas
-                        );
+                        return await this.processUpdate(client, match.type, match.id, query, requestBody);
                     }
                     match = this.matchUrlPattern(path, UrlPatterns.RELATIONSHIP);
                     if (match) {
                         // relationship update
                         return await this.processRelationshipCRUD(
-                            prisma,
+                            client,
                             'update',
                             match.type,
                             match.id,
                             match.relationship as string,
                             query,
-                            requestBody
+                            requestBody,
                         );
                     }
 
@@ -465,20 +470,20 @@ class RequestHandler extends APIHandlerBase {
                     let match = this.matchUrlPattern(path, UrlPatterns.SINGLE);
                     if (match) {
                         // resource deletion
-                        return await this.processDelete(prisma, match.type, match.id);
+                        return await this.processDelete(client, match.type, match.id);
                     }
 
                     match = this.matchUrlPattern(path, UrlPatterns.RELATIONSHIP);
                     if (match) {
                         // relationship deletion (collection relationship only)
                         return await this.processRelationshipCRUD(
-                            prisma,
+                            client,
                             'delete',
                             match.type,
                             match.id,
                             match.relationship as string,
                             query,
-                            requestBody
+                            requestBody,
                         );
                     }
 
@@ -491,32 +496,123 @@ class RequestHandler extends APIHandlerBase {
         } catch (err) {
             if (err instanceof InvalidValueError) {
                 return this.makeError('invalidValue', err.message);
+            } else if (err instanceof ORMError) {
+                return this.handleORMError(err);
             } else {
-                return this.handlePrismaError(err);
+                return this.handleGenericError(err);
             }
         }
     }
 
+    private handleGenericError(err: unknown): Response | PromiseLike<Response> {
+        return this.makeError('unknownError', err instanceof Error ? `${err.message}\n${err.stack}` : 'Unknown error');
+    }
+
+    private async processProcedureRequest({
+        client,
+        method,
+        proc,
+        query,
+        requestBody,
+    }: {
+        client: ClientContract<Schema>;
+        method: string;
+        proc?: string;
+        query?: Record<string, string | string[]>;
+        requestBody?: unknown;
+    }): Promise<Response> {
+        if (!proc) {
+            return this.makeProcBadInputErrorResponse('missing procedure name');
+        }
+
+        const procDef = getProcedureDef(this.schema, proc);
+        if (!procDef) {
+            return this.makeProcBadInputErrorResponse(`unknown procedure: ${proc}`);
+        }
+
+        const isMutation = !!procDef.mutation;
+        if (isMutation) {
+            if (method !== 'POST') {
+                return this.makeProcBadInputErrorResponse('invalid request method, only POST is supported');
+            }
+        } else {
+            if (method !== 'GET') {
+                return this.makeProcBadInputErrorResponse('invalid request method, only GET is supported');
+            }
+        }
+
+        const argsPayload = method === 'POST' ? requestBody : query;
+
+        // support SuperJSON request payload format
+        const { result: processedArgsPayload, error } = await processSuperJsonRequestPayload(argsPayload);
+        if (error) {
+            return this.makeProcBadInputErrorResponse(error);
+        }
+
+        let procInput: unknown;
+        try {
+            procInput = mapProcedureArgs(procDef, processedArgsPayload);
+        } catch (err) {
+            return this.makeProcBadInputErrorResponse(
+                err instanceof Error ? err.message : 'invalid procedure arguments',
+            );
+        }
+
+        try {
+            log(this.log, 'debug', () => `handling "$procs.${proc}" request`);
+
+            const clientResult = await (client as any).$procs?.[proc](procInput);
+            const toSerialize = this.toPlainObject(clientResult);
+
+            const { json, meta } = SuperJSON.serialize(toSerialize);
+            const responseBody: any = { data: json };
+            if (meta) {
+                responseBody.meta = { serialization: meta };
+            }
+
+            return { status: 200, body: responseBody };
+        } catch (err) {
+            log(this.log, 'error', `error occurred when handling "$procs.${proc}" request`, err);
+            if (err instanceof ORMError) {
+                throw err; // top-level handler will take care of it
+            }
+            return this.makeProcGenericErrorResponse(err);
+        }
+    }
+
+    private makeProcBadInputErrorResponse(message: string): Response {
+        const resp = this.makeError('invalidPayload', message, 400);
+        log(this.log, 'debug', () => `sending error response: ${JSON.stringify(resp)}`);
+        return resp;
+    }
+
+    private makeProcGenericErrorResponse(err: unknown): Response {
+        const message = err instanceof Error ? err.message : 'unknown error';
+        const resp = this.makeError('unknownError', message, 500);
+        log(this.log, 'debug', () => `sending error response: ${JSON.stringify(resp)}`);
+        return resp;
+    }
+
     private async processSingleRead(
-        prisma: DbClientContract,
+        client: ClientContract<Schema>,
         type: string,
         resourceId: string,
-        query: Record<string, string | string[]> | undefined
+        query: Record<string, string | string[]> | undefined,
     ): Promise<Response> {
-        const typeInfo = this.typeMap[type];
+        const typeInfo = this.getModelInfo(type);
         if (!typeInfo) {
             return this.makeUnsupportedModelError(type);
         }
 
-        const args: any = { where: this.makePrismaIdFilter(typeInfo.idFields, resourceId) };
+        const args: any = { where: this.makeIdFilter(typeInfo.idFields, resourceId) };
 
         // include IDs of relation fields so that they can be serialized
         this.includeRelationshipIds(type, args, 'include');
 
         // handle "include" query parameter
         let include: string[] | undefined;
-        if (query?.include) {
-            const { select, error, allIncludes } = this.buildRelationSelect(type, query.include, query);
+        if (query?.['include']) {
+            const { select, error, allIncludes } = this.buildRelationSelect(type, query['include'], query);
             if (error) {
                 return error;
             }
@@ -540,7 +636,7 @@ class RequestHandler extends APIHandlerBase {
             }
         }
 
-        const entity = await prisma[type].findUnique(args);
+        const entity = await (client as any)[type].findUnique(args);
 
         if (entity) {
             return {
@@ -553,13 +649,13 @@ class RequestHandler extends APIHandlerBase {
     }
 
     private async processFetchRelated(
-        prisma: DbClientContract,
+        client: ClientContract<Schema>,
         type: string,
         resourceId: string,
         relationship: string,
-        query: Record<string, string | string[]> | undefined
+        query: Record<string, string | string[]> | undefined,
     ): Promise<Response> {
-        const typeInfo = this.typeMap[type];
+        const typeInfo = this.getModelInfo(type);
         if (!typeInfo) {
             return this.makeUnsupportedModelError(type);
         }
@@ -573,8 +669,12 @@ class RequestHandler extends APIHandlerBase {
 
         // handle "include" query parameter
         let include: string[] | undefined;
-        if (query?.include) {
-            const { select: relationSelect, error, allIncludes } = this.buildRelationSelect(type, query.include, query);
+        if (query?.['include']) {
+            const {
+                select: relationSelect,
+                error,
+                allIncludes,
+            } = this.buildRelationSelect(type, query['include'], query);
             if (error) {
                 return error;
             }
@@ -594,7 +694,7 @@ class RequestHandler extends APIHandlerBase {
         }
 
         const args: any = {
-            where: this.makePrismaIdFilter(typeInfo.idFields, resourceId),
+            where: this.makeIdFilter(typeInfo.idFields, resourceId),
             select,
         };
 
@@ -606,7 +706,7 @@ class RequestHandler extends APIHandlerBase {
             }
         }
 
-        const entity: any = await prisma[type].findUnique(args);
+        const entity: any = await (client as any)[type].findUnique(args);
 
         let paginator: Paginator<any> | undefined;
 
@@ -624,7 +724,9 @@ class RequestHandler extends APIHandlerBase {
                 status: 200,
                 body: await this.serializeItems(relationInfo.type, entity[relationship], {
                     linkers: {
-                        document: new Linker(() => this.makeLinkUrl(`/${mappedType}/${resourceId}/${relationship}`)),
+                        document: new tsjapi.Linker(() =>
+                            this.makeLinkUrl(`/${mappedType}/${resourceId}/${relationship}`),
+                        ),
                         paginator,
                     },
                     include,
@@ -636,13 +738,13 @@ class RequestHandler extends APIHandlerBase {
     }
 
     private async processReadRelationship(
-        prisma: DbClientContract,
+        client: ClientContract<Schema>,
         type: string,
         resourceId: string,
         relationship: string,
-        query: Record<string, string | string[]> | undefined
+        query: Record<string, string | string[]> | undefined,
     ): Promise<Response> {
-        const typeInfo = this.typeMap[type];
+        const typeInfo = this.getModelInfo(type);
         if (!typeInfo) {
             return this.makeUnsupportedModelError(type);
         }
@@ -653,7 +755,7 @@ class RequestHandler extends APIHandlerBase {
         }
 
         const args: any = {
-            where: this.makePrismaIdFilter(typeInfo.idFields, resourceId),
+            where: this.makeIdFilter(typeInfo.idFields, resourceId),
             select: this.makeIdSelect(typeInfo.idFields),
         };
 
@@ -670,7 +772,7 @@ class RequestHandler extends APIHandlerBase {
             }
         }
 
-        const entity: any = await prisma[type].findUnique(args);
+        const entity: any = await (client as any)[type].findUnique(args);
         const mappedType = this.mapModelName(type);
 
         if (entity?._count?.[relationship] !== undefined) {
@@ -684,8 +786,8 @@ class RequestHandler extends APIHandlerBase {
         if (entity?.[relationship]) {
             const serialized: any = await this.serializeItems(relationInfo.type, entity[relationship], {
                 linkers: {
-                    document: new Linker(() =>
-                        this.makeLinkUrl(`/${mappedType}/${resourceId}/relationships/${relationship}`)
+                    document: new tsjapi.Linker(() =>
+                        this.makeLinkUrl(`/${mappedType}/${resourceId}/relationships/${relationship}`),
                     ),
                     paginator,
                 },
@@ -702,11 +804,11 @@ class RequestHandler extends APIHandlerBase {
     }
 
     private async processCollectionRead(
-        prisma: DbClientContract,
+        client: ClientContract<Schema>,
         type: string,
-        query: Record<string, string | string[]> | undefined
+        query: Record<string, string | string[]> | undefined,
     ): Promise<Response> {
-        const typeInfo = this.typeMap[type];
+        const typeInfo = this.getModelInfo(type);
         if (!typeInfo) {
             return this.makeUnsupportedModelError(type);
         }
@@ -735,8 +837,8 @@ class RequestHandler extends APIHandlerBase {
 
         // handle "include" query parameter
         let include: string[] | undefined;
-        if (query?.include) {
-            const { select, error, allIncludes } = this.buildRelationSelect(type, query.include, query);
+        if (query?.['include']) {
+            const { select, error, allIncludes } = this.buildRelationSelect(type, query['include'], query);
             if (error) {
                 return error;
             }
@@ -766,7 +868,7 @@ class RequestHandler extends APIHandlerBase {
         }
 
         if (limit === Infinity) {
-            const entities = await prisma[type].findMany(args);
+            const entities = await (client as any)[type].findMany(args);
 
             const body = await this.serializeItems(type, entities, { include });
             const total = entities.length;
@@ -780,8 +882,8 @@ class RequestHandler extends APIHandlerBase {
             args.take = limit;
 
             const [entities, count] = await Promise.all([
-                prisma[type].findMany(args),
-                prisma[type].count({ where: args.where ?? {} }),
+                (client as any)[type].findMany(args),
+                (client as any)[type].count({ where: args.where ?? {} }),
             ]);
             const total = count as number;
 
@@ -816,7 +918,7 @@ class RequestHandler extends APIHandlerBase {
             };
         }
 
-        const typeInfo = this.typeMap[lowerCaseFirst(type)];
+        const typeInfo = this.getModelInfo(type);
         if (!typeInfo) {
             return { select: undefined, error: this.makeUnsupportedModelError(type) };
         }
@@ -841,7 +943,7 @@ class RequestHandler extends APIHandlerBase {
 
         const totalPages = Math.ceil(total / limit);
 
-        return new Paginator(() => ({
+        return new tsjapi.Paginator(() => ({
             first: this.replaceURLSearchParams(baseUrl, { 'page[limit]': limit }),
             last: this.replaceURLSearchParams(baseUrl, {
                 'page[offset]': (totalPages - 1) * limit,
@@ -863,67 +965,48 @@ class RequestHandler extends APIHandlerBase {
         }));
     }
 
-    private processRequestBody(
-        type: string,
-        requestBody: unknown,
-        zodSchemas: ZodSchemas | undefined,
-        mode: 'create' | 'update'
-    ) {
+    private processRequestBody(requestBody: unknown) {
         let body: any = requestBody;
         if (body.meta?.serialization) {
             // superjson deserialize body if a serialization meta is provided
             body = SuperJSON.deserialize({ json: body, meta: body.meta.serialization });
         }
 
-        const parsed = this.createUpdatePayloadSchema.parse(body);
-        const attributes: any = parsed.data.attributes;
-
-        if (attributes) {
-            // use the zod schema (that only contains non-relation fields) to validate the payload,
-            // if available
-            const schemaName = `${upperCaseFirst(type)}${upperCaseFirst(mode)}ScalarSchema`;
-            const payloadSchema = zodSchemas?.models?.[schemaName];
-            if (payloadSchema) {
-                const parsed = payloadSchema.safeParse(attributes);
-                if (!parsed.success) {
-                    return {
-                        error: this.makeError(
-                            'invalidPayload',
-                            getZodErrorMessage(parsed.error),
-                            422,
-                            CrudFailureReason.DATA_VALIDATION_VIOLATION,
-                            parsed.error
-                        ),
-                    };
-                }
-            }
+        const parseResult = this.createUpdatePayloadSchema.safeParse(body);
+        if (!parseResult.success) {
+            return {
+                attributes: undefined,
+                relationships: undefined,
+                error: this.makeError('invalidPayload', getZodErrorMessage(parseResult.error)),
+            };
         }
 
-        return { attributes, relationships: parsed.data.relationships };
+        return {
+            attributes: parseResult.data.data.attributes,
+            relationships: parseResult.data.data.relationships,
+            error: undefined,
+        };
     }
 
     private async processCreate(
-        prisma: DbClientContract,
+        client: ClientContract<Schema>,
         type: string,
         _query: Record<string, string | string[]> | undefined,
         requestBody: unknown,
-        modelMeta: ModelMeta,
-        zodSchemas?: ZodSchemas
     ): Promise<Response> {
-        const typeInfo = this.typeMap[type];
+        const typeInfo = this.getModelInfo(type);
         if (!typeInfo) {
             return this.makeUnsupportedModelError(type);
         }
 
-        const { error, attributes, relationships } = this.processRequestBody(type, requestBody, zodSchemas, 'create');
-
+        const { attributes, relationships, error } = this.processRequestBody(requestBody);
         if (error) {
             return error;
         }
 
         const createPayload: any = { data: { ...attributes } };
 
-        // turn relationship payload into Prisma connect objects
+        // turn relationship payload into `connect` objects
         if (relationships) {
             for (const [key, data] of Object.entries<any>(relationships)) {
                 if (!data?.data) {
@@ -938,7 +1021,7 @@ class RequestHandler extends APIHandlerBase {
                 if (relationInfo.isCollection) {
                     createPayload.data[key] = {
                         connect: enumerate(data.data).map((item: any) =>
-                            this.makeIdConnect(relationInfo.idFields, item.id)
+                            this.makeIdConnect(relationInfo.idFields, item.id),
                         ),
                     };
                 } else {
@@ -953,7 +1036,7 @@ class RequestHandler extends APIHandlerBase {
                 // make sure ID fields are included for result serialization
                 createPayload.include = {
                     ...createPayload.include,
-                    [key]: { select: { [this.makePrismaIdKey(relationInfo.idFields)]: true } },
+                    [key]: { select: { [this.makeDefaultIdKey(relationInfo.idFields)]: true } },
                 };
             }
         }
@@ -961,7 +1044,7 @@ class RequestHandler extends APIHandlerBase {
         // include IDs of relation fields so that they can be serialized.
         this.includeRelationshipIds(type, createPayload, 'include');
 
-        const entity = await prisma[type].create(createPayload);
+        const entity = await (client as any)[type].create(createPayload);
         return {
             status: 201,
             body: await this.serializeItems(type, entity),
@@ -969,31 +1052,30 @@ class RequestHandler extends APIHandlerBase {
     }
 
     private async processUpsert(
-        prisma: DbClientContract,
+        client: ClientContract<Schema>,
         type: string,
         _query: Record<string, string | string[]> | undefined,
         requestBody: unknown,
-        modelMeta: ModelMeta,
-        zodSchemas?: ZodSchemas
     ) {
-        const typeInfo = this.typeMap[type];
+        const typeInfo = this.getModelInfo(type);
         if (!typeInfo) {
             return this.makeUnsupportedModelError(type);
         }
 
-        const { error, attributes, relationships } = this.processRequestBody(type, requestBody, zodSchemas, 'create');
-
+        const modelName = typeInfo.name;
+        const { attributes, relationships, error } = this.processRequestBody(requestBody);
         if (error) {
             return error;
         }
 
-        const matchFields = this.upsertMetaSchema.parse(requestBody).meta.matchFields;
+        const parseResult = this.upsertMetaSchema.safeParse(requestBody);
+        if (parseResult.error) {
+            return this.makeError('invalidPayload', getZodErrorMessage(parseResult.error));
+        }
+        const matchFields = parseResult.data.meta.matchFields;
+        const uniqueFieldSets = this.getUniqueFieldSets(modelName);
 
-        const uniqueFields = Object.values(modelMeta.models[type].uniqueConstraints || {}).map((uf) => uf.fields);
-
-        if (
-            !uniqueFields.some((uniqueCombination) => uniqueCombination.every((field) => matchFields.includes(field)))
-        ) {
+        if (!uniqueFieldSets.some((set) => set.every((field) => matchFields.includes(field)))) {
             return this.makeError('invalidPayload', 'Match fields must be unique fields', 400);
         }
 
@@ -1001,7 +1083,7 @@ class RequestHandler extends APIHandlerBase {
             where: this.makeUpsertWhere(matchFields, attributes, typeInfo),
             create: { ...attributes },
             update: {
-                ...Object.fromEntries(Object.entries(attributes).filter((e) => !matchFields.includes(e[0]))),
+                ...Object.fromEntries(Object.entries(attributes ?? {}).filter((e) => !matchFields.includes(e[0]))),
             },
         };
 
@@ -1013,18 +1095,18 @@ class RequestHandler extends APIHandlerBase {
 
                 const relationInfo = typeInfo.relationships[key];
                 if (!relationInfo) {
-                    return this.makeUnsupportedRelationshipError(type, key, 400);
+                    return this.makeUnsupportedRelationshipError(modelName, key, 400);
                 }
 
                 if (relationInfo.isCollection) {
                     upsertPayload.create[key] = {
                         connect: enumerate(data.data).map((item: any) =>
-                            this.makeIdConnect(relationInfo.idFields, item.id)
+                            this.makeIdConnect(relationInfo.idFields, item.id),
                         ),
                     };
                     upsertPayload.update[key] = {
                         set: enumerate(data.data).map((item: any) =>
-                            this.makeIdConnect(relationInfo.idFields, item.id)
+                            this.makeIdConnect(relationInfo.idFields, item.id),
                         ),
                     };
                 } else {
@@ -1042,26 +1124,36 @@ class RequestHandler extends APIHandlerBase {
         }
 
         // include IDs of relation fields so that they can be serialized.
-        this.includeRelationshipIds(type, upsertPayload, 'include');
+        this.includeRelationshipIds(modelName, upsertPayload, 'include');
 
-        const entity = await prisma[type].upsert(upsertPayload);
+        const entity = await (client as any)[modelName].upsert(upsertPayload);
 
         return {
             status: 201,
-            body: await this.serializeItems(type, entity),
+            body: await this.serializeItems(modelName, entity),
         };
     }
 
+    private getUniqueFieldSets(type: string) {
+        const modelDef = this.requireModel(type);
+        return Object.entries(modelDef.uniqueFields).map(
+            ([k, v]) =>
+                typeof v.type === 'string'
+                    ? [k] // single unique field
+                    : Object.keys(v), // compound unique fields
+        );
+    }
+
     private async processRelationshipCRUD(
-        prisma: DbClientContract,
+        client: ClientContract<Schema>,
         mode: 'create' | 'update' | 'delete',
         type: string,
         resourceId: string,
         relationship: string,
-        query: Record<string, string | string[]> | undefined,
-        requestBody: unknown
+        _query: Record<string, string | string[]> | undefined,
+        requestBody: unknown,
     ): Promise<Response> {
-        const typeInfo = this.typeMap[type];
+        const typeInfo = this.getModelInfo(type);
         if (!typeInfo) {
             return this.makeUnsupportedModelError(type);
         }
@@ -1077,7 +1169,7 @@ class RequestHandler extends APIHandlerBase {
         }
 
         const updateArgs: any = {
-            where: this.makePrismaIdFilter(typeInfo.idFields, resourceId),
+            where: this.makeIdFilter(typeInfo.idFields, resourceId),
             select: {
                 ...typeInfo.idFields.reduce((acc, field) => ({ ...acc, [field.name]: true }), {}),
                 [relationship]: { select: this.makeIdSelect(relationInfo.idFields) },
@@ -1088,13 +1180,7 @@ class RequestHandler extends APIHandlerBase {
             // zod-parse payload
             const parsed = this.updateSingleRelationSchema.safeParse(requestBody);
             if (!parsed.success) {
-                return this.makeError(
-                    'invalidPayload',
-                    getZodErrorMessage(parsed.error),
-                    undefined,
-                    CrudFailureReason.DATA_VALIDATION_VIOLATION,
-                    parsed.error
-                );
+                return this.makeError('invalidPayload', getZodErrorMessage(parsed.error));
             }
 
             if (parsed.data.data === null) {
@@ -1119,13 +1205,7 @@ class RequestHandler extends APIHandlerBase {
             // zod-parse payload
             const parsed = this.updateCollectionRelationSchema.safeParse(requestBody);
             if (!parsed.success) {
-                return this.makeError(
-                    'invalidPayload',
-                    getZodErrorMessage(parsed.error),
-                    undefined,
-                    CrudFailureReason.DATA_VALIDATION_VIOLATION,
-                    parsed.error
-                );
+                return this.makeError('invalidPayload', getZodErrorMessage(parsed.error));
             }
 
             // create -> connect, delete -> disconnect, update -> set
@@ -1134,20 +1214,20 @@ class RequestHandler extends APIHandlerBase {
             updateArgs.data = {
                 [relationship]: {
                     [relationVerb]: enumerate(parsed.data.data).map((item: any) =>
-                        this.makePrismaIdFilter(relationInfo.idFields, item.id)
+                        this.makeIdFilter(relationInfo.idFields, item.id),
                     ),
                 },
             };
         }
 
-        const entity: any = await prisma[type].update(updateArgs);
+        const entity: any = await (client as any)[type].update(updateArgs);
 
         const mappedType = this.mapModelName(type);
 
         const serialized: any = await this.serializeItems(relationInfo.type, entity[relationship], {
             linkers: {
-                document: new Linker(() =>
-                    this.makeLinkUrl(`/${mappedType}/${resourceId}/relationships/${relationship}`)
+                document: new tsjapi.Linker(() =>
+                    this.makeLinkUrl(`/${mappedType}/${resourceId}/relationships/${relationship}`),
                 ),
             },
             onlyIdentifier: true,
@@ -1160,30 +1240,28 @@ class RequestHandler extends APIHandlerBase {
     }
 
     private async processUpdate(
-        prisma: DbClientContract,
+        client: ClientContract<Schema>,
         type: any,
         resourceId: string,
         _query: Record<string, string | string[]> | undefined,
         requestBody: unknown,
-        modelMeta: ModelMeta,
-        zodSchemas?: ZodSchemas
     ): Promise<Response> {
-        const typeInfo = this.typeMap[type];
+        const typeInfo = this.getModelInfo(type);
         if (!typeInfo) {
             return this.makeUnsupportedModelError(type);
         }
 
-        const { error, attributes, relationships } = this.processRequestBody(type, requestBody, zodSchemas, 'update');
+        const { attributes, relationships, error } = this.processRequestBody(requestBody);
         if (error) {
             return error;
         }
 
         const updatePayload: any = {
-            where: this.makePrismaIdFilter(typeInfo.idFields, resourceId),
+            where: this.makeIdFilter(typeInfo.idFields, resourceId),
             data: { ...attributes },
         };
 
-        // turn relationships into prisma payload
+        // turn relationships into query payload
         if (relationships) {
             for (const [key, data] of Object.entries<any>(relationships)) {
                 if (!data?.data) {
@@ -1198,7 +1276,7 @@ class RequestHandler extends APIHandlerBase {
                 if (relationInfo.isCollection) {
                     updatePayload.data[key] = {
                         set: enumerate(data.data).map((item: any) => ({
-                            [this.makePrismaIdKey(relationInfo.idFields)]: item.id,
+                            [this.makeDefaultIdKey(relationInfo.idFields)]: item.id,
                         })),
                     };
                 } else {
@@ -1207,13 +1285,13 @@ class RequestHandler extends APIHandlerBase {
                     }
                     updatePayload.data[key] = {
                         connect: {
-                            [this.makePrismaIdKey(relationInfo.idFields)]: data.data.id,
+                            [this.makeDefaultIdKey(relationInfo.idFields)]: data.data.id,
                         },
                     };
                 }
                 updatePayload.include = {
                     ...updatePayload.include,
-                    [key]: { select: { [this.makePrismaIdKey(relationInfo.idFields)]: true } },
+                    [key]: { select: { [this.makeDefaultIdKey(relationInfo.idFields)]: true } },
                 };
             }
         }
@@ -1221,21 +1299,21 @@ class RequestHandler extends APIHandlerBase {
         // include IDs of relation fields so that they can be serialized.
         this.includeRelationshipIds(type, updatePayload, 'include');
 
-        const entity = await prisma[type].update(updatePayload);
+        const entity = await (client as any)[type].update(updatePayload);
         return {
             status: 200,
             body: await this.serializeItems(type, entity),
         };
     }
 
-    private async processDelete(prisma: DbClientContract, type: any, resourceId: string): Promise<Response> {
-        const typeInfo = this.typeMap[type];
+    private async processDelete(client: ClientContract<Schema>, type: any, resourceId: string): Promise<Response> {
+        const typeInfo = this.getModelInfo(type);
         if (!typeInfo) {
             return this.makeUnsupportedModelError(type);
         }
 
-        await prisma[type].delete({
-            where: this.makePrismaIdFilter(typeInfo.idFields, resourceId),
+        await (client as any)[type].delete({
+            where: this.makeIdFilter(typeInfo.idFields, resourceId),
         });
         return {
             status: 200,
@@ -1244,88 +1322,119 @@ class RequestHandler extends APIHandlerBase {
     }
 
     //#region utilities
-    private getIdFields(modelMeta: ModelMeta, model: string): FieldInfo[] {
+
+    private requireModel(model: string): ModelDef {
+        const modelDef = this.schema.models[model];
+        if (!modelDef) {
+            throw new Error(`Model ${model} is not defined in the schema`);
+        }
+        return modelDef;
+    }
+
+    private getIdFields(model: string): FieldDef[] {
+        const modelDef = this.requireModel(model);
         const modelLower = lowerCaseFirst(model);
         if (!(modelLower in this.externalIdMapping)) {
-            return getIdFields(modelMeta, model);
+            return Object.values(modelDef.fields).filter((f) => modelDef.idFields.includes(f.name));
         }
 
-        const metaData = modelMeta.models[modelLower] ?? {};
+        // map external ID name to unique constraint field
         const externalIdName = this.externalIdMapping[modelLower];
-        const uniqueConstraints = metaData.uniqueConstraints ?? {};
-        for (const [name, constraint] of Object.entries(uniqueConstraints)) {
+        for (const [name, info] of Object.entries(modelDef.uniqueFields)) {
             if (name === externalIdName) {
-                return constraint.fields.map((f) => requireField(modelMeta, model, f));
+                if (typeof info.type === 'string') {
+                    // single unique field
+                    return [this.requireField(model, name)];
+                } else {
+                    // compound unique fields
+                    return Object.keys(info).map((f) => this.requireField(model, f));
+                }
             }
         }
 
         throw new Error(`Model ${model} does not have unique key ${externalIdName}`);
     }
 
-    private buildTypeMap(logger: LoggerConfig | undefined, modelMeta: ModelMeta): void {
+    private requireField(model: string, field: string): FieldDef {
+        const modelDef = this.requireModel(model);
+        const fieldDef = modelDef.fields[field];
+        if (!fieldDef) {
+            throw new Error(`Field ${field} is not defined in model ${model}`);
+        }
+        return fieldDef;
+    }
+
+    private buildTypeMap() {
         this.typeMap = {};
-        for (const [model, { fields }] of Object.entries(modelMeta.models)) {
-            const idFields = this.getIdFields(modelMeta, model);
+        for (const [model, { fields }] of Object.entries(this.schema.models)) {
+            const idFields = this.getIdFields(model);
             if (idFields.length === 0) {
-                logWarning(logger, `Not including model ${model} in the API because it has no ID field`);
+                log(this.options.log, 'warn', `Not including model ${model} in the API because it has no ID field`);
                 continue;
             }
 
-            this.typeMap[model] = {
+            const modelInfo: ModelInfo = (this.typeMap[lowerCaseFirst(model)] = {
+                name: model,
                 idFields,
                 relationships: {},
                 fields,
-            };
+            });
 
             for (const [field, fieldInfo] of Object.entries(fields)) {
-                if (!fieldInfo.isDataModel) {
+                if (!fieldInfo.relation) {
                     continue;
                 }
-                const fieldTypeIdFields = this.getIdFields(modelMeta, fieldInfo.type);
+                const fieldTypeIdFields = this.getIdFields(fieldInfo.type);
                 if (fieldTypeIdFields.length === 0) {
-                    logWarning(
-                        logger,
-                        `Not including relation ${model}.${field} in the API because it has no ID field`
+                    log(
+                        this.options.log,
+                        'warn',
+                        `Not including relation ${model}.${field} in the API because it has no ID field`,
                     );
                     continue;
                 }
 
-                this.typeMap[model].relationships[field] = {
+                modelInfo.relationships[field] = {
                     type: fieldInfo.type,
                     idFields: fieldTypeIdFields,
-                    isCollection: !!fieldInfo.isArray,
-                    isOptional: !!fieldInfo.isOptional,
+                    isCollection: !!fieldInfo.array,
+                    isOptional: !!fieldInfo.optional,
                 };
             }
         }
+    }
+
+    private getModelInfo(model: string): ModelInfo | undefined {
+        return this.typeMap[lowerCaseFirst(model)];
     }
 
     private makeLinkUrl(path: string) {
         return `${this.options.endpoint}${path}`;
     }
 
-    private buildSerializers(modelMeta: ModelMeta) {
-        this.serializers = new Map();
+    private buildSerializers() {
         const linkers: Record<string, Linker<any>> = {};
 
-        for (const model of Object.keys(modelMeta.models)) {
-            const ids = this.getIdFields(modelMeta, model);
-            const mappedModel = this.mapModelName(model);
+        for (const model of Object.keys(this.schema.models)) {
+            const ids = this.getIdFields(model);
+            const modelLower = lowerCaseFirst(model);
+            const mappedModel = this.mapModelName(modelLower);
 
             if (ids.length < 1) {
                 continue;
             }
 
-            const linker = new Linker((items) =>
+            const linker = new tsjapi.Linker((items) =>
                 Array.isArray(items)
                     ? this.makeLinkUrl(`/${mappedModel}`)
-                    : this.makeLinkUrl(`/${mappedModel}/${this.getId(model, items, modelMeta)}`)
+                    : this.makeLinkUrl(`/${mappedModel}/${this.getId(model, items)}`),
             );
-            linkers[model] = linker;
+            linkers[modelLower] = linker;
 
             let projection: Record<string, 0> | null = {};
-            for (const [field, fieldMeta] of Object.entries<FieldInfo>(modelMeta.models[model].fields)) {
-                if (fieldMeta.isDataModel) {
+            const modelDef = this.requireModel(model);
+            for (const [field, fieldDef] of Object.entries(modelDef.fields)) {
+                if (fieldDef.relation) {
                     projection[field] = 0;
                 }
             }
@@ -1333,7 +1442,7 @@ class RequestHandler extends APIHandlerBase {
                 projection = null;
             }
 
-            const serializer = new Serializer(model, {
+            const serializer = new tsjapi.Serializer(model, {
                 version: '1.1',
                 idKey: this.makeIdKey(ids),
                 linkers: {
@@ -1342,30 +1451,32 @@ class RequestHandler extends APIHandlerBase {
                 },
                 projection,
             });
-            this.serializers.set(model, serializer);
+            this.serializers.set(modelLower, serializer);
         }
 
         // set relators
-        for (const model of Object.keys(modelMeta.models)) {
-            const serializer = this.serializers.get(model);
+        for (const model of Object.keys(this.schema.models)) {
+            const modelLower = lowerCaseFirst(model);
+            const serializer = this.serializers.get(modelLower);
             if (!serializer) {
                 continue;
             }
 
             const relators: Record<string, Relator<any>> = {};
-            for (const [field, fieldMeta] of Object.entries<FieldInfo>(modelMeta.models[model].fields)) {
-                if (!fieldMeta.isDataModel) {
+            const modelDef = this.requireModel(model);
+            for (const [field, fieldDef] of Object.entries(modelDef.fields)) {
+                if (!fieldDef.relation) {
                     continue;
                 }
-                const fieldSerializer = this.serializers.get(lowerCaseFirst(fieldMeta.type));
+                const fieldSerializer = this.serializers.get(lowerCaseFirst(fieldDef.type));
                 if (!fieldSerializer) {
                     continue;
                 }
-                const fieldIds = this.getIdFields(modelMeta, fieldMeta.type);
+                const fieldIds = this.getIdFields(fieldDef.type);
                 if (fieldIds.length > 0) {
-                    const mappedModel = this.mapModelName(model);
+                    const mappedModel = this.mapModelName(modelLower);
 
-                    const relator = new Relator(
+                    const relator = new tsjapi.Relator(
                         async (data) => {
                             return (data as any)[field];
                         },
@@ -1373,22 +1484,16 @@ class RequestHandler extends APIHandlerBase {
                         {
                             relatedName: field,
                             linkers: {
-                                related: new Linker((primary) =>
-                                    this.makeLinkUrl(
-                                        `/${lowerCaseFirst(model)}/${this.getId(model, primary, modelMeta)}/${field}`
-                                    )
+                                related: new tsjapi.Linker((primary) =>
+                                    this.makeLinkUrl(`/${mappedModel}/${this.getId(model, primary)}/${field}`),
                                 ),
-                                relationship: new Linker((primary) =>
+                                relationship: new tsjapi.Linker((primary) =>
                                     this.makeLinkUrl(
-                                        `/${lowerCaseFirst(mappedModel)}/${this.getId(
-                                            model,
-                                            primary,
-                                            modelMeta
-                                        )}/relationships/${field}`
-                                    )
+                                        `/${mappedModel}/${this.getId(model, primary)}/relationships/${field}`,
+                                    ),
                                 ),
                             },
-                        }
+                        },
                     );
                     relators[field] = relator;
                 }
@@ -1397,11 +1502,11 @@ class RequestHandler extends APIHandlerBase {
         }
     }
 
-    private getId(model: string, data: any, modelMeta: ModelMeta) {
+    private getId(model: string, data: any) {
         if (!data) {
             return undefined;
         }
-        const ids = this.getIdFields(modelMeta, model);
+        const ids = this.getIdFields(model);
         if (ids.length === 0) {
             return undefined;
         } else {
@@ -1437,7 +1542,7 @@ class RequestHandler extends APIHandlerBase {
     }
 
     private injectCompoundId(model: string, items: unknown) {
-        const typeInfo = this.typeMap[lowerCaseFirst(model)];
+        const typeInfo = this.getModelInfo(model);
         if (!typeInfo) {
             return;
         }
@@ -1501,19 +1606,19 @@ class RequestHandler extends APIHandlerBase {
         return r.toString();
     }
 
-    private makePrismaIdFilter(idFields: FieldInfo[], resourceId: string, nested: boolean = true) {
+    private makeIdFilter(idFields: FieldDef[], resourceId: string, nested: boolean = true) {
         const decodedId = decodeURIComponent(resourceId);
         if (idFields.length === 1) {
-            return { [idFields[0].name]: this.coerce(idFields[0], decodedId) };
+            return { [idFields[0]!.name]: this.coerce(idFields[0]!, decodedId) };
         } else if (nested) {
             return {
                 // TODO: support `@@id` with custom name
-                [idFields.map((idf) => idf.name).join(prismaIdDivider)]: idFields.reduce(
+                [idFields.map((idf) => idf.name).join(DEFAULT_ID_DIVIDER)]: idFields.reduce(
                     (acc, curr, idx) => ({
                         ...acc,
                         [curr.name]: this.coerce(curr, decodedId.split(this.idDivider)[idx]),
                     }),
-                    {}
+                    {},
                 ),
             };
         } else {
@@ -1522,44 +1627,44 @@ class RequestHandler extends APIHandlerBase {
                     ...acc,
                     [curr.name]: this.coerce(curr, decodedId.split(this.idDivider)[idx]),
                 }),
-                {}
+                {},
             );
         }
     }
 
-    private makeIdSelect(idFields: FieldInfo[]) {
+    private makeIdSelect(idFields: FieldDef[]) {
         if (idFields.length === 0) {
-            throw this.errors.noId;
+            throw this.errors['noId'];
         }
         return idFields.reduce((acc, curr) => ({ ...acc, [curr.name]: true }), {});
     }
 
-    private makeIdConnect(idFields: FieldInfo[], id: string | number) {
+    private makeIdConnect(idFields: FieldDef[], id: string | number) {
         if (idFields.length === 1) {
-            return { [idFields[0].name]: this.coerce(idFields[0], id) };
+            return { [idFields[0]!.name]: this.coerce(idFields[0]!, id) };
         } else {
             return {
-                [this.makePrismaIdKey(idFields)]: idFields.reduce(
+                [this.makeDefaultIdKey(idFields)]: idFields.reduce(
                     (acc, curr, idx) => ({
                         ...acc,
                         [curr.name]: this.coerce(curr, `${id}`.split(this.idDivider)[idx]),
                     }),
-                    {}
+                    {},
                 ),
             };
         }
     }
 
-    private makeIdKey(idFields: FieldInfo[]) {
+    private makeIdKey(idFields: FieldDef[]) {
         return idFields.map((idf) => idf.name).join(this.idDivider);
     }
 
-    private makePrismaIdKey(idFields: FieldInfo[]) {
+    private makeDefaultIdKey(idFields: FieldDef[]) {
         // TODO: support `@@id` with custom name
-        return idFields.map((idf) => idf.name).join(prismaIdDivider);
+        return idFields.map((idf) => idf.name).join(DEFAULT_ID_DIVIDER);
     }
 
-    private makeCompoundId(idFields: FieldInfo[], item: any) {
+    private makeCompoundId(idFields: FieldDef[], item: any) {
         return idFields.map((idf) => item[idf.name]).join(this.idDivider);
     }
 
@@ -1574,7 +1679,7 @@ class RequestHandler extends APIHandlerBase {
             matchFields.some((mf) => typeInfo.idFields.map((idf) => idf.name).includes(mf))
         ) {
             return {
-                [this.makePrismaIdKey(typeInfo.idFields)]: where,
+                [this.makeDefaultIdKey(typeInfo.idFields)]: where,
             };
         }
 
@@ -1582,7 +1687,7 @@ class RequestHandler extends APIHandlerBase {
     }
 
     private includeRelationshipIds(model: string, args: any, mode: 'select' | 'include') {
-        const typeInfo = this.typeMap[model];
+        const typeInfo = this.getModelInfo(model);
         if (!typeInfo) {
             return;
         }
@@ -1591,9 +1696,9 @@ class RequestHandler extends APIHandlerBase {
         }
     }
 
-    private coerce(fieldInfo: FieldInfo, value: any) {
+    private coerce(fieldDef: FieldDef, value: any) {
         if (typeof value === 'string') {
-            if (fieldInfo.isTypeDef || fieldInfo.type === 'Json') {
+            if (fieldDef.attributes?.some((attr) => attr.name === '@json')) {
                 try {
                     return JSON.parse(value);
                 } catch {
@@ -1601,19 +1706,31 @@ class RequestHandler extends APIHandlerBase {
                 }
             }
 
-            const type = fieldInfo.type;
-            if (type === 'Int' || type === 'BigInt') {
+            const type = fieldDef.type;
+            if (type === 'Int') {
                 const parsed = parseInt(value);
                 if (isNaN(parsed)) {
                     throw new InvalidValueError(`invalid ${type} value: ${value}`);
                 }
                 return parsed;
-            } else if (type === 'Float' || type === 'Decimal') {
+            } else if (type === 'BigInt') {
+                try {
+                    return BigInt(value);
+                } catch {
+                    throw new InvalidValueError(`invalid ${type} value: ${value}`);
+                }
+            } else if (type === 'Float') {
                 const parsed = parseFloat(value);
                 if (isNaN(parsed)) {
                     throw new InvalidValueError(`invalid ${type} value: ${value}`);
                 }
                 return parsed;
+            } else if (type === 'Decimal') {
+                try {
+                    return new Decimal(value);
+                } catch {
+                    throw new InvalidValueError(`invalid ${type} value: ${value}`);
+                }
             } else if (type === 'Boolean') {
                 if (value === 'true') {
                     return true;
@@ -1633,6 +1750,7 @@ class RequestHandler extends APIHandlerBase {
             if (
                 key.startsWith('filter[') ||
                 key.startsWith('sort[') ||
+                key === 'include' ||
                 key.startsWith('include[') ||
                 key.startsWith('fields[')
             ) {
@@ -1652,7 +1770,7 @@ class RequestHandler extends APIHandlerBase {
         let offset = 0;
         if (query['page[offset]']) {
             const value = query['page[offset]'];
-            const offsetText = Array.isArray(value) ? value[value.length - 1] : value;
+            const offsetText = Array.isArray(value) ? value[value.length - 1]! : value;
             offset = parseInt(offsetText);
             if (isNaN(offset) || offset < 0) {
                 offset = 0;
@@ -1667,7 +1785,7 @@ class RequestHandler extends APIHandlerBase {
         let limit = pageSizeOption;
         if (query['page[limit]']) {
             const value = query['page[limit]'];
-            const limitText = Array.isArray(value) ? value[value.length - 1] : value;
+            const limitText = Array.isArray(value) ? value[value.length - 1]! : value;
             limit = parseInt(limitText);
             if (isNaN(limit) || limit <= 0) {
                 limit = pageSizeOption;
@@ -1680,13 +1798,13 @@ class RequestHandler extends APIHandlerBase {
 
     private buildFilter(
         type: string,
-        query: Record<string, string | string[]> | undefined
+        query: Record<string, string | string[]> | undefined,
     ): { filter: any; error: any } {
         if (!query) {
             return { filter: undefined, error: undefined };
         }
 
-        const typeInfo = this.typeMap[lowerCaseFirst(type)];
+        const typeInfo = this.getModelInfo(type);
         if (!typeInfo) {
             return { filter: undefined, error: this.makeUnsupportedModelError(type) };
         }
@@ -1700,11 +1818,11 @@ class RequestHandler extends APIHandlerBase {
 
             // try matching query parameter key as "filter[x][y]..."
             const match = key.match(this.filterParamPattern);
-            if (!match || !match.groups) {
+            if (!match || !match.groups || !match.groups['match']) {
                 continue;
             }
 
-            const filterKeys = match.groups.match
+            const filterKeys = match.groups['match']
                 .replaceAll(/[[\]]/g, ' ')
                 .split(' ')
                 .filter((i) => i);
@@ -1713,7 +1831,7 @@ class RequestHandler extends APIHandlerBase {
                 continue;
             }
 
-            // turn filter into a nested Prisma query object
+            // turn filter into a nested query object
 
             const item: any = {};
             let curr = item;
@@ -1722,7 +1840,7 @@ class RequestHandler extends APIHandlerBase {
             for (const filterValue of enumerate(value)) {
                 for (let i = 0; i < filterKeys.length; i++) {
                     // extract filter operation from (optional) trailing $op
-                    let filterKey = filterKeys[i];
+                    let filterKey = filterKeys[i]!;
                     let filterOp: FilterOperationType | undefined;
                     const pos = filterKey.indexOf('$');
                     if (pos > 0) {
@@ -1737,35 +1855,36 @@ class RequestHandler extends APIHandlerBase {
                         };
                     }
 
-                    const fieldInfo =
+                    const idFields = this.getIdFields(currType.name);
+                    const fieldDef =
                         filterKey === 'id'
-                            ? Object.values(currType.fields).find((f) => f.isId)
+                            ? Object.values(currType.fields).find((f) => idFields.some((idf) => idf.name === f.name))
                             : currType.fields[filterKey];
-                    if (!fieldInfo) {
+                    if (!fieldDef) {
                         return { filter: undefined, error: this.makeError('invalidFilter') };
                     }
 
-                    if (!fieldInfo.isDataModel) {
+                    if (!fieldDef.relation) {
                         // regular field
                         if (i !== filterKeys.length - 1) {
                             // must be the last segment of a filter
                             return { filter: undefined, error: this.makeError('invalidFilter') };
                         }
-                        curr[fieldInfo.name] = this.makeFilterValue(fieldInfo, filterValue, filterOp);
+                        curr[fieldDef.name] = this.makeFilterValue(fieldDef, filterValue, filterOp);
                     } else {
                         // relation field
                         if (i === filterKeys.length - 1) {
-                            curr[fieldInfo.name] = this.makeFilterValue(fieldInfo, filterValue, filterOp);
+                            curr[fieldDef.name] = this.makeFilterValue(fieldDef, filterValue, filterOp);
                         } else {
                             // keep going
-                            if (fieldInfo.isArray) {
+                            if (fieldDef.array) {
                                 // collection filtering implies "some" operation
-                                curr[fieldInfo.name] = { some: {} };
-                                curr = curr[fieldInfo.name].some;
+                                curr[fieldDef.name] = { some: {} };
+                                curr = curr[fieldDef.name].some;
                             } else {
-                                curr = curr[fieldInfo.name] = {};
+                                curr = curr[fieldDef.name] = {};
                             }
-                            currType = this.typeMap[lowerCaseFirst(fieldInfo.type)];
+                            currType = this.getModelInfo(fieldDef.type)!;
                         }
                     }
                 }
@@ -1786,7 +1905,7 @@ class RequestHandler extends APIHandlerBase {
             return { sort: undefined, error: undefined };
         }
 
-        const typeInfo = this.typeMap[lowerCaseFirst(type)];
+        const typeInfo = this.getModelInfo(type);
         if (!typeInfo) {
             return { sort: undefined, error: this.makeUnsupportedModelError(type) };
         }
@@ -1806,10 +1925,10 @@ class RequestHandler extends APIHandlerBase {
                 let currType = typeInfo;
 
                 for (let i = 0; i < parts.length; i++) {
-                    const part = parts[i];
+                    const part = parts[i]!;
 
                     const fieldInfo = currType.fields[part];
-                    if (!fieldInfo || fieldInfo.isArray) {
+                    if (!fieldInfo || fieldInfo.array) {
                         return {
                             sort: undefined,
                             error: this.makeError('invalidSort', 'sorting by array field is not supported'),
@@ -1817,13 +1936,13 @@ class RequestHandler extends APIHandlerBase {
                     }
 
                     if (i === parts.length - 1) {
-                        if (fieldInfo.isDataModel) {
+                        if (fieldInfo.relation) {
                             // relation field: sort by id
-                            const relationType = this.typeMap[lowerCaseFirst(fieldInfo.type)];
+                            const relationType = this.getModelInfo(fieldInfo.type);
                             if (!relationType) {
                                 return { sort: undefined, error: this.makeUnsupportedModelError(fieldInfo.type) };
                             }
-                            curr[fieldInfo.name] = relationType.idFields.reduce((acc: any, idField: FieldInfo) => {
+                            curr[fieldInfo.name] = relationType.idFields.reduce((acc: any, idField: FieldDef) => {
                                 acc[idField.name] = dir;
                                 return acc;
                             }, {});
@@ -1832,26 +1951,26 @@ class RequestHandler extends APIHandlerBase {
                             curr[fieldInfo.name] = dir;
                         }
                     } else {
-                        if (!fieldInfo.isDataModel) {
+                        if (!fieldInfo.relation) {
                             // must be a relation field
                             return {
                                 sort: undefined,
                                 error: this.makeError(
                                     'invalidSort',
-                                    'intermediate sort segments must be relationships'
+                                    'intermediate sort segments must be relationships',
                                 ),
                             };
                         }
                         // keep going
                         curr = curr[fieldInfo.name] = {};
-                        currType = this.typeMap[lowerCaseFirst(fieldInfo.type)];
+                        currType = this.getModelInfo(fieldInfo.type)!;
                         if (!currType) {
                             return { sort: undefined, error: this.makeUnsupportedModelError(fieldInfo.type) };
                         }
                     }
-
-                    result.push(sortItem);
                 }
+
+                result.push(sortItem);
             }
         }
 
@@ -1861,9 +1980,9 @@ class RequestHandler extends APIHandlerBase {
     private buildRelationSelect(
         type: string,
         include: string | string[],
-        query: Record<string, string | string[]> | undefined
+        query: Record<string, string | string[]> | undefined,
     ) {
-        const typeInfo = this.typeMap[lowerCaseFirst(type)];
+        const typeInfo = this.getModelInfo(type);
         if (!typeInfo) {
             return { select: undefined, error: this.makeUnsupportedModelError(type) };
         }
@@ -1881,13 +2000,13 @@ class RequestHandler extends APIHandlerBase {
                 let currType = typeInfo;
 
                 for (let i = 0; i < parts.length; i++) {
-                    const relation = parts[i];
+                    const relation = parts[i]!;
                     const relationInfo = currType.relationships[relation];
                     if (!relationInfo) {
                         return { select: undefined, error: this.makeUnsupportedRelationshipError(type, relation, 400) };
                     }
 
-                    currType = this.typeMap[lowerCaseFirst(relationInfo.type)];
+                    currType = this.getModelInfo(relationInfo.type)!;
                     if (!currType) {
                         return { select: undefined, error: this.makeUnsupportedModelError(relationInfo.type) };
                     }
@@ -1918,29 +2037,38 @@ class RequestHandler extends APIHandlerBase {
         return { select: result, error: undefined, allIncludes };
     }
 
-    private makeFilterValue(fieldInfo: FieldInfo, value: string, op: FilterOperationType): any {
+    private makeFilterValue(fieldDef: FieldDef, value: string, op: FilterOperationType): any {
         // TODO: inequality filters?
-        if (fieldInfo.isDataModel) {
+        if (fieldDef.relation) {
             // relation filter is converted to an ID filter
-            const info = this.typeMap[lowerCaseFirst(fieldInfo.type)];
-            if (fieldInfo.isArray) {
+            const info = this.getModelInfo(fieldDef.type)!;
+            if (fieldDef.array) {
                 // filtering a to-many relation, imply 'some' operator
                 const values = value.split(',').filter((i) => i);
                 const filterValue =
                     values.length > 1
-                        ? { OR: values.map((v) => this.makePrismaIdFilter(info.idFields, v, false)) }
-                        : this.makePrismaIdFilter(info.idFields, value, false);
+                        ? { OR: values.map((v) => this.makeIdFilter(info.idFields, v, false)) }
+                        : this.makeIdFilter(info.idFields, value, false);
                 return { some: filterValue };
             } else {
                 const values = value.split(',').filter((i) => i);
                 if (values.length > 1) {
-                    return { OR: values.map((v) => this.makePrismaIdFilter(info.idFields, v, false)) };
+                    return { OR: values.map((v) => this.makeIdFilter(info.idFields, v, false)) };
                 } else {
-                    return { is: this.makePrismaIdFilter(info.idFields, value, false) };
+                    return { is: this.makeIdFilter(info.idFields, value, false) };
                 }
             }
         } else {
-            const coerced = this.coerce(fieldInfo, value);
+            if (op === 'between') {
+                const parts = value
+                    .split(',')
+                    .map((v) => this.coerce(fieldDef, v));
+                if (parts.length !== 2) {
+                    throw new InvalidValueError(`"between" expects exactly 2 comma-separated values`);
+                }
+                return { between: [parts[0]!, parts[1]!] };
+            }
+            const coerced = this.coerce(fieldDef, value);
             switch (op) {
                 case 'icontains':
                     return { contains: coerced, mode: 'insensitive' };
@@ -1949,7 +2077,7 @@ class RequestHandler extends APIHandlerBase {
                     const values = value
                         .split(',')
                         .filter((i) => i)
-                        .map((v) => this.coerce(fieldInfo, v));
+                        .map((v) => this.coerce(fieldDef, v));
                     return { [op]: values };
                 }
                 case 'isEmpty':
@@ -1959,7 +2087,7 @@ class RequestHandler extends APIHandlerBase {
                     return { isEmpty: value === 'true' ? true : false };
                 default:
                     if (op === undefined) {
-                        if (fieldInfo.isTypeDef || fieldInfo.type === 'Json') {
+                        if (fieldDef.attributes?.some((attr) => attr.name === '@json')) {
                             // handle JSON value equality filter
                             return { equals: coerced };
                         }
@@ -1968,7 +2096,7 @@ class RequestHandler extends APIHandlerBase {
                         const values = value
                             .split(',')
                             .filter((i) => i)
-                            .map((v) => this.coerce(fieldInfo, v));
+                            .map((v) => this.coerce(fieldDef, v));
                         return values.length > 1 ? { in: values } : { equals: values[0] };
                     } else {
                         return { [op]: coerced };
@@ -1981,7 +2109,7 @@ class RequestHandler extends APIHandlerBase {
         type: string,
         injectTarget: any,
         injectKey: string,
-        query: Record<string, string | string[]> | undefined
+        query: Record<string, string | string[]> | undefined,
     ) {
         const { filter, error: filterError } = this.buildFilter(type, query);
         if (filterError) {
@@ -2016,71 +2144,48 @@ class RequestHandler extends APIHandlerBase {
         }
     }
 
-    private handlePrismaError(err: unknown) {
-        if (isPrismaClientKnownRequestError(err)) {
-            if (err.code === PrismaErrorCode.CONSTRAINT_FAILED) {
-                if (err.meta?.reason === CrudFailureReason.DATA_VALIDATION_VIOLATION) {
-                    return this.makeError(
-                        'validationError',
-                        undefined,
-                        422,
-                        err.meta?.reason as string,
-                        err.meta?.zodErrors as ZodError
-                    );
-                } else {
-                    return this.makeError('forbidden', undefined, 403, err.meta?.reason as string);
-                }
-            } else if (err.code === 'P2025' || err.code === 'P2018') {
-                return this.makeError('notFound');
-            } else {
-                return {
-                    status: 400,
-                    body: {
-                        errors: [
-                            {
-                                status: 400,
-                                code: 'prisma-error',
-                                prismaCode: err.code,
-                                title: 'Prisma error',
-                                detail: err.message,
-                            },
-                        ],
-                    },
-                };
-            }
-        } else {
-            const _err = err as Error;
-            return this.makeError('unknownError', `${_err.message}\n${_err.stack}`);
-        }
+    private handleORMError(err: ORMError) {
+        return match(err.reason)
+            .with(ORMErrorReason.INVALID_INPUT, () => {
+                return this.makeError('validationError', err.message, 422);
+            })
+            .with(ORMErrorReason.REJECTED_BY_POLICY, () => {
+                return this.makeError('forbidden', err.message, 403, { reason: err.rejectedByPolicyReason });
+            })
+            .with(ORMErrorReason.NOT_FOUND, () => {
+                return this.makeError('notFound', err.message, 404);
+            })
+            .with(ORMErrorReason.DB_QUERY_ERROR, () => {
+                return this.makeError('queryError', err.message, 400, {
+                    dbErrorCode: err.dbErrorCode,
+                });
+            })
+            .otherwise(() => {
+                return this.makeError('unknownError', err.message);
+            });
     }
 
     private makeError(
         code: keyof typeof this.errors,
         detail?: string,
         status?: number,
-        reason?: string,
-        zodErrors?: ZodError<any>
+        otherFields: Record<string, any> = {},
     ) {
+        status = status ?? this.errors[code]?.status ?? 500;
         const error: any = {
-            status: status ?? this.errors[code].status,
+            status,
             code: paramCase(code),
-            title: this.errors[code].title,
+            title: this.errors[code]?.title,
         };
 
         if (detail) {
             error.detail = detail;
         }
 
-        if (reason) {
-            error.reason = reason;
-        }
-
-        if (zodErrors) {
-            error.zodErrors = zodErrors;
-        }
+        Object.assign(error, otherFields);
 
         return {
-            status: status ?? this.errors[code].status,
+            status,
             body: {
                 errors: [error],
             },
@@ -2097,10 +2202,3 @@ class RequestHandler extends APIHandlerBase {
 
     //#endregion
 }
-
-export default function makeHandler(options: Options) {
-    const handler = new RequestHandler(options);
-    return handler.handleRequest.bind(handler);
-}
-
-export { makeHandler as RestApiHandler };

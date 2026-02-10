@@ -1,76 +1,94 @@
-import {
-    CrudFailureReason,
-    DbOperations,
-    PrismaErrorCode,
-    ZodSchemas,
-    isPrismaClientKnownRequestError,
-    isPrismaClientUnknownRequestError,
-    isPrismaClientValidationError,
-} from '@zenstackhq/runtime';
-import { upperCaseFirst, getZodErrorMessage } from '@zenstackhq/runtime/local-helpers';
+import { lowerCaseFirst, safeJSONStringify } from '@zenstackhq/common-helpers';
+import { ORMError, ORMErrorReason, type ClientContract } from '@zenstackhq/orm';
+import type { SchemaDef } from '@zenstackhq/orm/schema';
 import SuperJSON from 'superjson';
-import { ZodError } from 'zod';
-import { Response } from '../../types';
-import { APIHandlerBase, RequestContext } from '../base';
-import { logError, registerCustomSerializers } from '../utils';
+import { match } from 'ts-pattern';
+import z from 'zod';
+import { fromError } from 'zod-validation-error/v4';
+import type { ApiHandler, LogConfig, RequestContext, Response } from '../../types';
+import { getProcedureDef, mapProcedureArgs, PROCEDURE_ROUTE_PREFIXES } from '../common/procedures';
+import { loggerSchema } from '../common/schemas';
+import { processSuperJsonRequestPayload, unmarshalQ } from '../common/utils';
+import { log, registerCustomSerializers } from '../utils';
 
 registerCustomSerializers();
 
-const ERROR_STATUS_MAPPING: Record<string, number> = {
-    [PrismaErrorCode.CONSTRAINT_FAILED]: 403,
-    [PrismaErrorCode.REQUIRED_CONNECTED_RECORD_NOT_FOUND]: 404,
-    [PrismaErrorCode.DEPEND_ON_RECORD_NOT_FOUND]: 404,
+/**
+ * Options for {@link RPCApiHandler}
+ */
+export type RPCApiHandlerOptions<Schema extends SchemaDef = SchemaDef> = {
+    /**
+     * The schema
+     */
+    schema: Schema;
+
+    /**
+     * Logging configuration
+     */
+    log?: LogConfig;
 };
 
 /**
- * Prisma RPC style API request handler that mirrors the Prisma Client API
+ * RPC style API request handler that mirrors the ZenStackClient API
  */
-class RequestHandler extends APIHandlerBase {
-    async handleRequest({
-        prisma,
-        method,
-        path,
-        query,
-        requestBody,
-        modelMeta,
-        zodSchemas,
-        logger,
-    }: RequestContext): Promise<Response> {
-        modelMeta = modelMeta ?? this.defaultModelMeta;
-        if (!modelMeta) {
-            throw new Error('Model metadata is not provided or loaded from default location');
-        }
+export class RPCApiHandler<Schema extends SchemaDef = SchemaDef> implements ApiHandler<Schema> {
+    constructor(private readonly options: RPCApiHandlerOptions<Schema>) {
+        this.validateOptions(options);
+    }
 
+    private validateOptions(options: RPCApiHandlerOptions<Schema>) {
+        const schema = z.strictObject({ schema: z.object(), log: loggerSchema.optional() });
+        const parseResult = schema.safeParse(options);
+        if (!parseResult.success) {
+            throw new Error(`Invalid options: ${fromError(parseResult.error)}`);
+        }
+    }
+
+    get schema(): Schema {
+        return this.options.schema;
+    }
+
+    get log(): LogConfig | undefined {
+        return this.options.log;
+    }
+
+    async handleRequest({ client, method, path, query, requestBody }: RequestContext<Schema>): Promise<Response> {
         const parts = path.split('/').filter((p) => !!p);
         const op = parts.pop();
-        const model = parts.pop();
+        let model = parts.pop();
 
         if (parts.length !== 0 || !op || !model) {
-            return { status: 400, body: this.makeError('invalid request path') };
+            return this.makeBadInputErrorResponse('invalid request path');
         }
 
+        if (model === PROCEDURE_ROUTE_PREFIXES) {
+            return this.handleProcedureRequest({
+                client,
+                method: method.toUpperCase(),
+                proc: op,
+                query,
+                requestBody,
+            });
+        }
+
+        model = lowerCaseFirst(model);
         method = method.toUpperCase();
-        const dbOp = op as keyof DbOperations;
         let args: unknown;
         let resCode = 200;
 
-        switch (dbOp) {
+        switch (op) {
             case 'create':
             case 'createMany':
+            case 'createManyAndReturn':
             case 'upsert':
                 if (method !== 'POST') {
-                    return {
-                        status: 400,
-                        body: this.makeError('invalid request method, only POST is supported'),
-                    };
+                    return this.makeBadInputErrorResponse('invalid request method, only POST is supported');
                 }
                 if (!requestBody) {
-                    return { status: 400, body: this.makeError('missing request body') };
+                    return this.makeBadInputErrorResponse('missing request body');
                 }
 
                 args = requestBody;
-
-                // TODO: upsert's status code should be conditional
                 resCode = 201;
                 break;
 
@@ -80,30 +98,25 @@ class RequestHandler extends APIHandlerBase {
             case 'aggregate':
             case 'groupBy':
             case 'count':
-            case 'check':
+            case 'exists':
                 if (method !== 'GET') {
-                    return {
-                        status: 400,
-                        body: this.makeError('invalid request method, only GET is supported'),
-                    };
+                    return this.makeBadInputErrorResponse('invalid request method, only GET is supported');
                 }
                 try {
-                    args = query?.q ? this.unmarshalQ(query.q as string, query.meta as string | undefined) : {};
+                    args = query?.['q'] ? unmarshalQ(query['q'] as string, query['meta'] as string | undefined) : {};
                 } catch {
-                    return { status: 400, body: this.makeError('invalid "q" query parameter') };
+                    return this.makeBadInputErrorResponse('invalid "q" query parameter');
                 }
                 break;
 
             case 'update':
             case 'updateMany':
+            case 'updateManyAndReturn':
                 if (method !== 'PUT' && method !== 'PATCH') {
-                    return {
-                        status: 400,
-                        body: this.makeError('invalid request method, only PUT AND PATCH are supported'),
-                    };
+                    return this.makeBadInputErrorResponse('invalid request method, only PUT or PATCH are supported');
                 }
                 if (!requestBody) {
-                    return { status: 400, body: this.makeError('missing request body') };
+                    return this.makeBadInputErrorResponse('missing request body');
                 }
 
                 args = requestBody;
@@ -112,184 +125,222 @@ class RequestHandler extends APIHandlerBase {
             case 'delete':
             case 'deleteMany':
                 if (method !== 'DELETE') {
-                    return {
-                        status: 400,
-                        body: this.makeError('invalid request method, only DELETE is supported'),
-                    };
+                    return this.makeBadInputErrorResponse('invalid request method, only DELETE is supported');
                 }
                 try {
-                    args = query?.q ? this.unmarshalQ(query.q as string, query.meta as string | undefined) : {};
-                } catch {
-                    return { status: 400, body: this.makeError('invalid "q" query parameter') };
+                    args = query?.['q'] ? unmarshalQ(query['q'] as string, query['meta'] as string | undefined) : {};
+                } catch (err) {
+                    return this.makeBadInputErrorResponse(
+                        err instanceof Error ? err.message : 'invalid "q" query parameter',
+                    );
                 }
                 break;
 
             default:
-                return { status: 400, body: this.makeError('invalid operation: ' + op) };
+                return this.makeBadInputErrorResponse('invalid operation: ' + op);
         }
 
-        const { error, zodErrors, data: parsedArgs } = await this.processRequestPayload(args, model, dbOp, zodSchemas);
+        const { result: processedArgs, error } = await this.processRequestPayload(args);
         if (error) {
-            return { status: 422, body: this.makeError(error, CrudFailureReason.DATA_VALIDATION_VIOLATION, zodErrors) };
+            return this.makeBadInputErrorResponse(error);
         }
 
         try {
-            if (!prisma[model]) {
-                return { status: 400, body: this.makeError(`unknown model name: ${model}`) };
+            if (!this.isValidModel(client, model)) {
+                return this.makeBadInputErrorResponse(`unknown model name: ${model}`);
             }
 
-            const result = await prisma[model][dbOp](parsedArgs);
+            log(
+                this.options.log,
+                'debug',
+                () => `handling "${model}.${op}" request with args: ${safeJSONStringify(processedArgs)}`,
+            );
 
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            let response: any = { data: result };
+            const clientResult = await (client as any)[model][op](processedArgs);
+            let responseBody: any = { data: clientResult };
 
             // superjson serialize response
-            if (result) {
-                const { json, meta } = SuperJSON.serialize(result);
-                response = { data: json };
+            if (clientResult) {
+                const { json, meta } = SuperJSON.serialize(clientResult);
+                responseBody = { data: json };
                 if (meta) {
-                    response.meta = { serialization: meta };
+                    responseBody.meta = { serialization: meta };
                 }
             }
 
-            return { status: resCode, body: response };
+            const response = { status: resCode, body: responseBody };
+            log(
+                this.options.log,
+                'debug',
+                () => `sending response for "${model}.${op}" request: ${safeJSONStringify(response)}`,
+            );
+            return response;
         } catch (err) {
-            if (isPrismaClientKnownRequestError(err)) {
-                let status: number;
-
-                if (err.meta?.reason === CrudFailureReason.DATA_VALIDATION_VIOLATION) {
-                    // data validation error
-                    status = 422;
-                } else {
-                    status = ERROR_STATUS_MAPPING[err.code] ?? 400;
-                }
-
-                const { error } = this.makeError(
-                    err.message,
-                    err.meta?.reason as string,
-                    err.meta?.zodErrors as ZodError
-                );
-                return {
-                    status,
-                    body: {
-                        error: {
-                            ...error,
-                            prisma: true,
-                            code: err.code,
-                        },
-                    },
-                };
-            } else if (isPrismaClientUnknownRequestError(err) || isPrismaClientValidationError(err)) {
-                logError(logger, err.message);
-                return {
-                    status: 400,
-                    body: {
-                        error: {
-                            prisma: true,
-                            message: err.message,
-                        },
-                    },
-                };
+            log(this.options.log, 'error', `error occurred when handling "${model}.${op}" request`, err);
+            if (err instanceof ORMError) {
+                return this.makeORMErrorResponse(err);
             } else {
-                const _err = err as Error;
-                logError(logger, _err.message + (_err.stack ? '\n' + _err.stack : ''));
-                return {
-                    status: 400,
-                    body: this.makeError((err as Error).message),
-                };
+                return this.makeGenericErrorResponse(err);
             }
         }
     }
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    private makeError(message: string, reason?: string, zodErrors?: ZodError<any>) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const error: any = { message, reason };
-        if (reason === CrudFailureReason.ACCESS_POLICY_VIOLATION || reason === CrudFailureReason.RESULT_NOT_READABLE) {
-            error.rejectedByPolicy = true;
+    private async handleProcedureRequest({
+        client,
+        method,
+        proc,
+        query,
+        requestBody,
+    }: {
+        client: ClientContract<Schema>;
+        method: string;
+        proc?: string;
+        query?: Record<string, string | string[]>;
+        requestBody?: unknown;
+    }): Promise<Response> {
+        if (!proc) {
+            return this.makeBadInputErrorResponse('missing procedure name');
         }
-        if (reason === CrudFailureReason.DATA_VALIDATION_VIOLATION) {
-            error.rejectedByValidation = true;
-        }
-        if (zodErrors) {
-            error.zodErrors = zodErrors;
-        }
-        return { error };
-    }
 
-    private async processRequestPayload(
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        args: any,
-        model: string,
-        dbOp: string,
-        zodSchemas: ZodSchemas | undefined
-    ) {
-        const { meta, ...rest } = args;
-        if (meta?.serialization) {
-            // superjson deserialization
-            args = SuperJSON.deserialize({ json: rest, meta: meta.serialization });
+        const procDef = getProcedureDef(this.options.schema, proc);
+        if (!procDef) {
+            return this.makeBadInputErrorResponse(`unknown procedure: ${proc}`);
         }
-        return this.zodValidate(zodSchemas, model, dbOp as keyof DbOperations, args);
-    }
 
-    private getZodSchema(zodSchemas: ZodSchemas, model: string, operation: keyof DbOperations) {
-        // e.g.: UserInputSchema { findUnique: [schema] }
-        return zodSchemas.input?.[`${upperCaseFirst(model)}InputSchema`]?.[operation];
-    }
+        const isMutation = !!procDef.mutation;
 
-    private zodValidate(
-        zodSchemas: ZodSchemas | undefined,
-        model: string,
-        operation: keyof DbOperations,
-        args: unknown
-    ) {
-        const zodSchema = zodSchemas && this.getZodSchema(zodSchemas, model, operation);
-        if (zodSchema) {
-            const parseResult = zodSchema.safeParse(args);
-            if (parseResult.success) {
-                return { data: args, error: undefined, zodErrors: undefined };
-            } else {
-                return {
-                    data: undefined,
-                    error: getZodErrorMessage(parseResult.error),
-                    zodErrors: parseResult.error,
-                };
+        if (isMutation) {
+            if (method !== 'POST') {
+                return this.makeBadInputErrorResponse('invalid request method, only POST is supported');
             }
         } else {
-            return { data: args, error: undefined, zodErrors: undefined };
-        }
-    }
-
-    private unmarshalQ(value: string, meta: string | undefined) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        let parsedValue: any;
-        try {
-            parsedValue = JSON.parse(value);
-        } catch {
-            throw new Error('invalid "q" query parameter');
+            if (method !== 'GET') {
+                return this.makeBadInputErrorResponse('invalid request method, only GET is supported');
+            }
         }
 
-        if (meta) {
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            let parsedMeta: any;
+        let argsPayload = method === 'POST' ? requestBody : undefined;
+        if (method === 'GET') {
             try {
-                parsedMeta = JSON.parse(meta);
-            } catch {
-                throw new Error('invalid "meta" query parameter');
-            }
-
-            if (parsedMeta.serialization) {
-                return SuperJSON.deserialize({ json: parsedValue, meta: parsedMeta.serialization });
+                argsPayload = query?.['q']
+                    ? unmarshalQ(query['q'] as string, query['meta'] as string | undefined)
+                    : undefined;
+            } catch (err) {
+                return this.makeBadInputErrorResponse(
+                    err instanceof Error ? err.message : 'invalid "q" query parameter',
+                );
             }
         }
 
-        return parsedValue;
+        const { result: processedArgsPayload, error } = await processSuperJsonRequestPayload(argsPayload);
+        if (error) {
+            return this.makeBadInputErrorResponse(error);
+        }
+
+        let procInput: unknown;
+        try {
+            procInput = mapProcedureArgs(procDef, processedArgsPayload);
+        } catch (err) {
+            return this.makeBadInputErrorResponse(err instanceof Error ? err.message : 'invalid procedure arguments');
+        }
+
+        try {
+            log(this.options.log, 'debug', () => `handling "$procs.${proc}" request`);
+
+            const clientResult = await (client as any).$procs?.[proc](procInput);
+
+            const { json, meta } = SuperJSON.serialize(clientResult);
+            const responseBody: any = { data: json };
+            if (meta) {
+                responseBody.meta = { serialization: meta };
+            }
+
+            const response = { status: 200, body: responseBody };
+            log(
+                this.options.log,
+                'debug',
+                () => `sending response for "$procs.${proc}" request: ${safeJSONStringify(response)}`,
+            );
+            return response;
+        } catch (err) {
+            log(this.options.log, 'error', `error occurred when handling "$procs.${proc}" request`, err);
+            if (err instanceof ORMError) {
+                return this.makeORMErrorResponse(err);
+            }
+            return this.makeGenericErrorResponse(err);
+        }
+    }
+
+    private isValidModel(client: ClientContract<Schema>, model: string) {
+        return Object.keys(client.$schema.models).some((m) => lowerCaseFirst(m) === lowerCaseFirst(model));
+    }
+
+    private makeBadInputErrorResponse(message: string) {
+        const resp = {
+            status: 400,
+            body: { error: { message } },
+        };
+        log(this.options.log, 'debug', () => `sending error response: ${safeJSONStringify(resp)}`);
+        return resp;
+    }
+
+    private makeGenericErrorResponse(err: unknown) {
+        const resp = {
+            status: 500,
+            body: { error: { message: err instanceof Error ? err.message : 'unknown error' } },
+        };
+        log(
+            this.options.log,
+            'debug',
+            () => `sending error response: ${safeJSONStringify(resp)}${err instanceof Error ? '\n' + err.stack : ''}`,
+        );
+        return resp;
+    }
+
+    private makeORMErrorResponse(err: ORMError) {
+        let status = 400;
+        const error: any = { message: err.message, reason: err.reason };
+
+        match(err.reason)
+            .with(ORMErrorReason.NOT_FOUND, () => {
+                status = 404;
+                error.model = err.model;
+            })
+            .with(ORMErrorReason.INVALID_INPUT, () => {
+                status = 422;
+                error.rejectedByValidation = true;
+                error.model = err.model;
+            })
+            .with(ORMErrorReason.REJECTED_BY_POLICY, () => {
+                status = 403;
+                error.rejectedByPolicy = true;
+                error.model = err.model;
+                error.rejectReason = err.rejectedByPolicyReason;
+            })
+            .with(ORMErrorReason.DB_QUERY_ERROR, () => {
+                status = 400;
+                error.dbErrorCode = err.dbErrorCode;
+            })
+            .otherwise(() => {});
+
+        const resp = { status, body: { error } };
+        log(this.options.log, 'debug', () => `sending error response: ${safeJSONStringify(resp)}`);
+        return resp;
+    }
+
+    private async processRequestPayload(args: any) {
+        const { meta, ...rest } = args ?? {};
+        if (meta?.serialization) {
+            try {
+                // superjson deserialization
+                args = SuperJSON.deserialize({ json: rest, meta: meta.serialization });
+            } catch (err) {
+                return { result: undefined, error: `failed to deserialize request payload: ${(err as Error).message}` };
+            }
+        } else {
+            // drop meta when no serialization info is present
+            args = rest;
+        }
+        return { result: args, error: undefined };
     }
 }
-
-export default function makeHandler() {
-    const handler = new RequestHandler();
-    return handler.handleRequest.bind(handler);
-}
-
-export { makeHandler as RPCApiHandler };

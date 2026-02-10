@@ -5,14 +5,11 @@
     <img src="https://raw.githubusercontent.com/zenstackhq/zenstack-docs/main/static/img/logo.png" height="128">
     </picture>
     </a>
-    <h1>ZenStack</h1>
-    <a href="https://www.npmjs.com/package/zenstack">
-        <img src="https://img.shields.io/npm/v/zenstack/release-v2">
+    <h1>ZenStack: Modern Data Layer for TypeScript Apps</h1>
+    <a href="https://www.npmjs.com/package/@zenstackhq/cli?activeTab=versions">
+        <img src="https://img.shields.io/npm/v/%40zenstackhq%2Fcli/latest">
     </a>
-    <a href="https://www.npmjs.com/package/zenstack">
-        <img src="https://img.shields.io/npm/dm/@zenstackhq/runtime">
-    </a>
-    <img src="https://github.com/zenstackhq/zenstack/actions/workflows/build-test.yml/badge.svg">
+    <img src="https://github.com/zenstackhq/zenstack-v3/actions/workflows/build-test.yml/badge.svg">
     <a href="https://twitter.com/zenstackhq">
         <img src="https://img.shields.io/twitter/url?style=social&url=https%3A%2F%2Fgithub.com%2Fzenstackhq%2Fzenstack">
     </a>
@@ -24,231 +21,72 @@
     </a>
 </div>
 
-## V3 is released!
+# What's ZenStack
 
-[ZenStack v3](https://zenstack.dev) is released! It replaced Prisma ORM with its own implementation built on top of [Kysely](https://kysely.dev) - lighter, faster, and more flexible. The code resides in a [separate repo](https://github.com/zenstackhq/zenstack-v3).
+> Read full documentation at 👉🏻 https://zenstack.dev/docs.
 
-## What it is
+ZenStack is a TypeScript database toolkit for developing full-stack or backend Node.js/Bun applications. It provides a unified data modeling and query solution with the following features:
 
-ZenStack is a Node.js/TypeScript toolkit that simplifies the development of web applications. It enhances [Prisma ORM](https://prisma.io) with a flexible Authorization layer and auto-generated, type-safe APIs/hooks, unlocking its full potential for full-stack development.
+- 🔧 Modern schema-first ORM that's compatible with [Prisma](https://github.com/prisma/prisma)'s schema and API
+- 📊 Versatile API - high-level ORM queries + low-level [Kysely](https://kysely.dev) query builder
+- 🔐 Built-in access control and data validation
+- 🚀 Advanced data modeling patterns like [polymorphism](https://zenstack.dev/docs/orm/polymorphism)
+- 🧩 Designed for extensibility and flexibility
+- ⚙️ Automatic CRUD web APIs with adapters for popular frameworks
+- 🏖️ Automatic [TanStack Query](https://github.com/TanStack/query) hooks for easy CRUD from the frontend
 
-Our goal is to let you save time writing boilerplate code and focus on building real features!
+# What's New in V3
 
-## How it works
+ZenStack V3 is a major rewrite of [V2](https://github.com/zenstackhq/zenstack). It replaced Prisma ORM with its own ORM engine built on top of [Kysely](https://kysely.dev) while keeping a Prisma-compatible query API. This architecture change brings the level of flexibility that we couldn't imagine in previous versions. Please check [this blog post](https://zenstack.dev/blog/next-chapter-1) for why we made this bold decision.
 
-> Read full documentation at 👉🏻 [https://zenstack.dev/docs/2.x/](https://zenstack.dev/docs/2.x/). Join [Discord](https://discord.gg/Ykhr738dUe) for feedback and questions.
+Even without using advanced features, ZenStack offers the following benefits as a drop-in replacement to Prisma:
 
-ZenStack incrementally extends Prisma's power with the following four layers:
+1. Pure TypeScript implementation without any Rust/WASM components.
+2. More TypeScript type inference, less code generation.
+3. Fully-typed query-builder API as a better escape hatch compared to Prisma's [raw queries](https://www.prisma.io/docs/orm/prisma-client/using-raw-sql/raw-queries) or [typed SQL](https://www.prisma.io/docs/orm/prisma-client/using-raw-sql/typedsql).
 
-### 1. ZModel - an extended Prisma schema language
+# Try It Now
 
-ZenStack introduces a data modeling language called "ZModel" - a superset of Prisma schema language. It extended Prisma schema with custom attributes and functions and, based on that, implemented a flexible access control layer around Prisma.
+[![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/~/github.com/zenstackhq/v3-doc-quick-start?file=zenstack%2fschema.zmodel&file=main.ts&view=editor&showSidebar=0&hideNavigation=1&hideExplorer=1)
 
-```ts
-// base.zmodel
-abstract model Base {
-    id String @id
-    author User @relation(fields: [authorId], references: [id])
-    authorId String
+## Installation
 
-    // 🔐 allow full CRUD by author
-    @@allow('all', author == auth())
-}
+### 1. Creating a new project
+
+Use the following command to scaffold a simple TypeScript command line application with ZenStack configured:
+
+```bash
+npm create zenstack@latest my-project
 ```
 
-```ts
-// schema.zmodel
-import "base"
-model Post extends Base {
-    title String
-    published Boolean @default(false)
+### 2. Setting up an existing project
 
-    // 🔐 allow logged-in users to read published posts
-    @@allow('read', auth() != null && published)
-}
+Or, if you have an existing project, use the CLI to initialize it:
+
+```bash
+npx @zenstackhq/cli@latest init
 ```
 
-The `zenstack` CLI transpiles the ZModel into a standard Prisma schema, which you can use with the regular Prisma workflows.
+### 3. Setting up manually
 
-### 2. Runtime enhancements to Prisma client
+Alternatively, you can set it up manually:
 
-At runtime, transparent proxies are created around Prisma clients for intercepting queries and mutations to enforce access policies.
-
-```ts
-import { enhance } from '@zenstackhq/runtime';
-
-// a regular Prisma client
-const prisma = new PrismaClient();
-
-async function getPosts(userId: string) {
-    // create an enhanced Prisma client that has access control enabled
-    const enhanced = enhance(prisma, { user: userId });
-
-    // only posts that're visible to the user will be returned
-    return enhanced.post.findMany();
-}
+```bash
+npm install -D @zenstackhq/cli
+npm install @zenstackhq/orm
 ```
 
-### 3. Automatic RESTful APIs through server adapters
+Then create a `zenstack` folder and a `schema.zmodel` file in it.
 
-Server adapter packages help you wrap an access-control-enabled Prisma client into backend CRUD APIs that can be safely called from the frontend. Here's an example for Next.js:
+# Documentation
 
-```ts
-// /src/app/api/model/[...path]/route.ts
+[https://zenstack.dev/docs/](https://zenstack.dev/docs/)
 
-import { NextRequestHandler } from '@zenstackhq/server/next';
-import type { NextRequest } from 'next/server';
-import { enhance } from '@zenstackhq/runtime';
-import { getSessionUser } from '@lib/auth';
-import { prisma } from '@lib/db';
-
-// Mount Prisma-style APIs: "/api/model/post/findMany", "/api/model/post/create", etc.
-// Can be configured to provide standard RESTful APIs (using JSON:API) instead.
-
-function getPrisma(req: NextRequest) {
-    // getSessionUser extracts the current session user from the request, its
-    // implementation depends on your auth solution
-    return enhance(prisma, { user: getSessionUser(req) });
-}
-
-const handler = NextRequestHandler({ getPrisma, useAppDir: true });
-
-export { handler as GET, handler as POST, handler as PUT, handler as PATCH, handler as DELETE };
-```
-
-### 4. Generated client libraries (hooks) for data access
-
-Plugins can generate strong-typed client libraries that talk to the aforementioned APIs. Here's an example for React:
-
-```tsx
-// components/MyPosts.tsx
-
-import { useFindManyPost } from '@lib/hooks';
-
-const MyPosts = () => {
-    // list all posts that're visible to the current user, together with their authors
-    const { data: posts } = useFindManyPost({
-        include: { author: true },
-        orderBy: { createdAt: 'desc' },
-    });
-
-    return (
-        <ul>
-            {posts?.map((post) => (
-                <li key={post.id}>
-                    {post.title} by {post.author.name}
-                </li>
-            ))}
-        </ul>
-    );
-};
-```
-
-## Architecture
-
-The following diagram gives a high-level architecture overview of ZenStack.
-
-![Architecture](https://zenstack.dev/img/architecture-light.png)
-
-## Links
-
--   [Home](https://zenstack.dev)
--   [Documentation](https://zenstack.dev/docs)
--   [Community chat](https://discord.gg/Ykhr738dUe)
--   [Twitter](https://twitter.com/zenstackhq)
--   [Blog](https://zenstack.dev/blog)
-
-## Features
-
--   Access control and data validation rules right inside your Prisma schema
--   Auto-generated OpenAPI (RESTful) specifications, services, and client libraries
--   End-to-end type safety
--   Extensible: custom attributes, functions, and a plugin system
--   A framework-agnostic core with framework-specific adapters
--   Uncompromised performance
-
-### Plugins
-
--   Prisma schema generator
--   [Zod](https://zod.dev/) schema generator
--   [SWR](https://github.com/vercel/swr) and [TanStack Query](https://github.com/TanStack/query) hooks generator
--   OpenAPI specification generator
--   [tRPC](https://trpc.io) router generator
--   🙋🏻 [Request for a plugin](https://discord.gg/Ykhr738dUe)
-
-### Framework adapters
-
--   [Next.js](https://zenstack.dev/docs/reference/server-adapters/next)
--   [Nuxt](https://zenstack.dev/docs/reference/server-adapters/nuxt)
--   [SvelteKit](https://zenstack.dev/docs/reference/server-adapters/sveltekit)
--   [Fastify](https://zenstack.dev/docs/reference/server-adapters/fastify)
--   [ExpressJS](https://zenstack.dev/docs/reference/server-adapters/express)
--   [NestJS](https://zenstack.dev/docs/reference/server-adapters/nestjs)
--   [Hono](https://zenstack.dev/docs/reference/server-adapters/hono)
--   [Elysia](https://zenstack.dev/docs/reference/server-adapters/elysia)
--   [TanStack Start](https://zenstack.dev/docs/reference/server-adapters/tanstack-start)
--   🙋🏻 [Request for an adapter](https://discord.gg/Ykhr738dUe)
-
-### Prisma schema extensions
-
--   [Custom attributes and functions](https://zenstack.dev/docs/reference/zmodel-language#custom-attributes-and-functions)
--   [Multi-file schema and model inheritance](https://zenstack.dev/docs/guides/multiple-schema)
--   [Polymorphic Relations](https://zenstack.dev/docs/guides/polymorphism)
--   [Strongly typed JSON field](https://zenstack.dev/docs/guides/typing-json)
--   [Field encryption](https://zenstack.dev/docs/guides/field-encryption)
--   🙋🏻 [Request for an extension](https://discord.gg/Ykhr738dUe)
-
-## Examples
-
-### Schema Samples
-
-The [sample repo](https://github.com/zenstackhq/authz-modeling-samples) includes the following patterns:
-
--   ACL
--   RBAC
--   ABAC
--   Multi-Tenancy
-
-You can use [this blog post](https://zenstack.dev/blog/model-authz) as an introduction.
-
-### Multi-Tenant Todo App
-
-Check out the [Multi-tenant Todo App](https://zenstack-todo.vercel.app/) for a running example. You can find different implementations below:
-
--   [Next.js + NextAuth + TanStack Query](https://github.com/zenstackhq/sample-todo-nextjs-tanstack)
--   [Next.js + NextAuth + SWR](https://github.com/zenstackhq/sample-todo-nextjs)
--   [Next.js + NextAuth + tRPC](https://github.com/zenstackhq/sample-todo-trpc)
--   [Nuxt + TanStack Query](https://github.com/zenstackhq/sample-todo-nuxt)
--   [SvelteKit + TanStack Query](https://github.com/zenstackhq/sample-todo-sveltekit)
--   [RedwoodJS](https://github.com/zenstackhq/sample-todo-redwood)
-
-### Blog App
-
--   [Next.js + App Route + TanStack Query](https://github.com/zenstackhq/docs-tutorial-nextjs-app-dir)
--   [Next.js + Pages Route + SWR](https://github.com/zenstackhq/docs-tutorial-nextjs)
--   [Next.js + App Route + tRPC](https://github.com/zenstackhq/sample-blog-nextjs-app-trpc)
--   [Nuxt + TanStack Query](https://github.com/zenstackhq/docs-tutorial-nuxt)
--   [SvelteKit](https://github.com/zenstackhq/docs-tutorial-sveltekit)
--   [Remix](https://github.com/zenstackhq/docs-tutorial-remix)
--   [NestJS Backend API](https://github.com/zenstackhq/docs-tutorial-nestjs)
--   [Express Backend API](https://github.com/zenstackhq/docs-tutorial-express)
--   [Clerk Integration](https://github.com/zenstackhq/docs-tutorial-clerk)
-
-## Community
-
-Join our [discord server](https://discord.gg/Ykhr738dUe) for chat and updates!
-
-## Contributing
-
-If you like ZenStack, join us to make it a better tool! Please use the [Contributing Guide](CONTRIBUTING.md) for details on how to get started, and don't hesitate to join [Discord](https://discord.gg/Ykhr738dUe) to share your thoughts. Documentations reside in a separate repo: [zenstack-docs](https://github.com/zenstackhq/zenstack-docs).
-
-Please also consider [sponsoring our work](https://github.com/sponsors/zenstackhq) to speed up the development. Your contribution will be 100% used as a bounty reward to encourage community members to help fix bugs, add features, and improve documentation.
-
-## Sponsors
+# Sponsors
 
 Thank you for your generous support!
 
-### Current Sponsors
+## Current Sponsors
 
 <table>
   <tr>
@@ -260,7 +98,7 @@ Thank you for your generous support!
   </tr>
 </table>
 
-### Previous Sponsors
+## Previous Sponsors
 
 <table>
   <tr>
@@ -270,22 +108,6 @@ Thank you for your generous support!
   </tr>
 </table>
 
-## Contributors
+# Community
 
-Thanks to all the contributors who have helped make ZenStack better!
-
-#### Source
-
-<a href="https://github.com/zenstackhq/zenstack/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=zenstackhq/zenstack" />
-</a>
-
-#### Docs
-
-<a href="https://github.com/zenstackhq/zenstack-docs/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=zenstackhq/zenstack-docs" />
-</a>
-
-## License
-
-[MIT](LICENSE)
+Join our [discord server](https://discord.gg/Ykhr738dUe) for chat and updates!

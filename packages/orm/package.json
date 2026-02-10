@@ -1,0 +1,142 @@
+{
+    "name": "@zenstackhq/orm",
+    "version": "3.3.3",
+    "description": "ZenStack ORM",
+    "type": "module",
+    "scripts": {
+        "build": "tsc --noEmit && tsup-node",
+        "watch": "tsup-node --watch",
+        "lint": "eslint src --ext ts",
+        "pack": "pnpm pack"
+    },
+    "keywords": [],
+    "author": "ZenStack Team",
+    "license": "MIT",
+    "files": [
+        "dist"
+    ],
+    "exports": {
+        ".": {
+            "import": {
+                "types": "./dist/index.d.ts",
+                "default": "./dist/index.js"
+            },
+            "require": {
+                "types": "./dist/index.d.cts",
+                "default": "./dist/index.cjs"
+            }
+        },
+        "./schema": {
+            "import": {
+                "types": "./dist/schema.d.ts",
+                "default": "./dist/schema.js"
+            },
+            "require": {
+                "types": "./dist/schema.d.cts",
+                "default": "./dist/schema.cjs"
+            }
+        },
+        "./dialects/sqlite": {
+            "import": {
+                "types": "./dist/dialects/sqlite.d.ts",
+                "default": "./dist/dialects/sqlite.js"
+            },
+            "require": {
+                "types": "./dist/dialects/sqlite.d.cts",
+                "default": "./dist/dialects/sqlite.cjs"
+            }
+        },
+        "./dialects/postgres": {
+            "import": {
+                "types": "./dist/dialects/postgres.d.ts",
+                "default": "./dist/dialects/postgres.js"
+            },
+            "require": {
+                "types": "./dist/dialects/postgres.d.cts",
+                "default": "./dist/dialects/postgres.cjs"
+            }
+        },
+        "./dialects/mysql": {
+            "import": {
+                "types": "./dist/dialects/mysql.d.ts",
+                "default": "./dist/dialects/mysql.js"
+            },
+            "require": {
+                "types": "./dist/dialects/mysql.d.cts",
+                "default": "./dist/dialects/mysql.cjs"
+            }
+        },
+        "./dialects/sql.js": {
+            "import": {
+                "types": "./dist/dialects/sql.js.d.ts",
+                "default": "./dist/dialects/sql.js.js"
+            },
+            "require": {
+                "types": "./dist/dialects/sql.js.d.cts",
+                "default": "./dist/dialects/sql.js.cjs"
+            }
+        },
+        "./helpers": {
+            "import": {
+                "types": "./dist/helpers.d.ts",
+                "default": "./dist/helpers.js"
+            },
+            "require": {
+                "types": "./dist/helpers.d.cts",
+                "default": "./dist/helpers.cjs"
+            }
+        },
+        "./package.json": {
+            "import": "./package.json",
+            "require": "./package.json"
+        }
+    },
+    "dependencies": {
+        "@paralleldrive/cuid2": "^2.2.2",
+        "@zenstackhq/common-helpers": "workspace:*",
+        "@zenstackhq/schema": "workspace:*",
+        "cuid": "^3.0.0",
+        "decimal.js": "catalog:",
+        "json-stable-stringify": "^1.3.0",
+        "kysely": "catalog:",
+        "nanoid": "^5.0.9",
+        "postgres-array": "^3.0.4",
+        "toposort": "^2.0.2",
+        "ts-pattern": "catalog:",
+        "ulid": "^3.0.0",
+        "uuid": "^11.0.5",
+        "zod-validation-error": "catalog:"
+    },
+    "peerDependencies": {
+        "better-sqlite3": "catalog:",
+        "pg": "catalog:",
+        "mysql2": "catalog:",
+        "sql.js": "catalog:",
+        "zod": "catalog:"
+    },
+    "peerDependenciesMeta": {
+        "better-sqlite3": {
+            "optional": true
+        },
+        "pg": {
+            "optional": true
+        },
+        "mysql2": {
+            "optional": true
+        },
+        "sql.js": {
+            "optional": true
+        }
+    },
+    "devDependencies": {
+        "@types/better-sqlite3": "catalog:",
+        "@types/pg": "^8.0.0",
+        "@types/sql.js": "^1.4.9",
+        "@types/toposort": "^2.0.7",
+        "@zenstackhq/eslint-config": "workspace:*",
+        "@zenstackhq/typescript-config": "workspace:*",
+        "@zenstackhq/vitest-config": "workspace:*",
+        "tsx": "^4.19.2",
+        "zod": "^4.1.0"
+    }
+}

@@ -1,28 +1,28 @@
 import { Decimal } from 'decimal.js';
 import SuperJSON from 'superjson';
-import { LoggerConfig } from '../types';
+import { match } from 'ts-pattern';
+import { ZodError } from 'zod';
+import { fromError as fromError3 } from 'zod-validation-error/v3';
+import { fromError as fromError4 } from 'zod-validation-error/v4';
+import type { LogConfig, LogLevel } from '../types';
 
-export function logError(logger: LoggerConfig | undefined | null, message: string, code?: string) {
-    if (logger === undefined) {
-        console.error(`@zenstackhq/server: error ${code ? '[' + code + ']' : ''}, ${message}`);
-    } else if (logger?.error) {
-        logger.error(message, code);
+export function log(logger: LogConfig | undefined, level: LogLevel, message: string | (() => string), error?: unknown) {
+    if (!logger) {
+        return;
     }
-}
 
-export function logWarning(logger: LoggerConfig | undefined | null, message: string) {
-    if (logger === undefined) {
-        console.warn(`@zenstackhq/server: ${message}`);
-    } else if (logger?.warn) {
-        logger.warn(message);
-    }
-}
+    const getMessage = typeof message === 'function' ? message : () => message;
 
-export function logInfo(logger: LoggerConfig | undefined | null, message: string) {
-    if (logger === undefined) {
-        console.log(`@zenstackhq/server: ${message}`);
-    } else if (logger?.info) {
-        logger.info(message);
+    if (typeof logger === 'function') {
+        logger(level, getMessage(), error);
+    } else if (logger.includes(level)) {
+        const logFn = match(level)
+            .with('debug', () => console.debug)
+            .with('info', () => console.info)
+            .with('warn', () => console.warn)
+            .with('error', () => console.error)
+            .exhaustive();
+        logFn(`@zenstackhq/server: [${level}] ${getMessage()}${error ? `\n${error}` : ''}`);
     }
 }
 
@@ -36,7 +36,7 @@ export function registerCustomSerializers() {
             serialize: (v) => v.toJSON(),
             deserialize: (v) => new Decimal(v),
         },
-        'Decimal'
+        'Decimal',
     );
 
     // `Buffer` is not available in edge runtime
@@ -47,7 +47,18 @@ export function registerCustomSerializers() {
                 serialize: (v) => v.toString('base64'),
                 deserialize: (v) => Buffer.from(v, 'base64'),
             },
-            'Bytes'
+            'Bytes',
         );
+    }
+}
+
+/**
+ * Format ZodError into a readable string
+ */
+export function getZodErrorMessage(error: ZodError): string {
+    if ('_zod' in error) {
+        return fromError4(error).toString();
+    } else {
+        return fromError3(error).toString();
     }
 }

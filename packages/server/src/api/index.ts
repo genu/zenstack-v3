@@ -1,2 +1,2 @@
-export { RPCApiHandler } from './rpc';
-export { RestApiHandler } from './rest';
+export { RestApiHandler, type RestApiHandlerOptions } from './rest';
+export { RPCApiHandler, type RPCApiHandlerOptions } from './rpc';

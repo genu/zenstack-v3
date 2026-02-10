@@ -1,56 +1,82 @@
-import type { ModelMeta, ZodSchemas } from '@zenstackhq/runtime';
-import { RequestContext } from './api/base';
-
-type LoggerMethod = (message: string, code?: string) => void;
+import type { ClientContract } from '@zenstackhq/orm';
+import type { SchemaDef } from '@zenstackhq/orm/schema';
 
 /**
- * Logger config.
+ * Log levels
  */
-export type LoggerConfig = {
-    debug?: LoggerMethod;
-    info?: LoggerMethod;
-    warn?: LoggerMethod;
-    error?: LoggerMethod;
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
+
+/**
+ * Logger function
+ */
+export type Logger = (level: LogLevel, message: string, error?: unknown) => void;
+
+/**
+ * Log configuration
+ */
+export type LogConfig = ReadonlyArray<LogLevel> | Logger;
+
+/**
+ * API request context
+ */
+export type RequestContext<Schema extends SchemaDef> = {
+    /**
+     * The ZenStackClient instance
+     */
+    client: ClientContract<Schema>;
+
+    /**
+     * The HTTP method
+     */
+    method: string;
+
+    /**
+     * The request endpoint path (excluding any prefix)
+     */
+    path: string;
+
+    /**
+     * The query parameters
+     */
+    query?: Record<string, string | string[]>;
+
+    /**
+     * The request body object
+     */
+    requestBody?: unknown;
 };
 
 /**
  * API response
  */
 export type Response = {
+    /**
+     * HTTP status code
+     */
     status: number;
+
+    /**
+     * Response body
+     */
     body: unknown;
 };
 
 /**
- * API request handler function
+ * Framework-agnostic API handler.
  */
-export type HandleRequestFn = (req: RequestContext) => Promise<Response>;
-
-/**
- * Base type for options used to create a server adapter.
- */
-export interface AdapterBaseOptions {
+export interface ApiHandler<Schema extends SchemaDef = SchemaDef> {
     /**
-     * Logger settings
+     * The schema associated with this handler.
      */
-    logger?: LoggerConfig;
+    get schema(): Schema;
 
     /**
-     * Model metadata. By default loaded from the `node_module/.zenstack/model-meta`
-     * module. You can pass it in explicitly if you configured ZenStack to output to
-     * a different location.
+     * Logging configuration.
      */
-    modelMeta?: ModelMeta;
+    get log(): LogConfig | undefined;
 
     /**
-     * Zod schemas for validating request input. Pass `true` to load from standard location
-     * (need to enable `@core/zod` plugin in schema.zmodel) or omit to disable input validation.
+     * Handle an API request.
      */
-    zodSchemas?: ZodSchemas | boolean;
-
-    /**
-     * Api request handler function. Can be created using `@zenstackhq/server/api/rest` or `@zenstackhq/server/api/rpc` factory functions.
-     * Defaults to RPC-style API handler created with `/api/rpc`.
-     */
-    handler?: HandleRequestFn;
+    handleRequest(context: RequestContext<Schema>): Promise<Response>;
 }

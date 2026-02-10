@@ -1,7 +1,7 @@
-import { AstNode } from 'langium';
-import { AbstractDeclaration, BinaryExpr, DataModel, ExpressionType } from './generated/ast';
+import type { AstNode } from 'langium';
+import { AbstractDeclaration, BinaryExpr, DataField, DataModel, type ExpressionType } from './generated/ast';
 
-export { AstNode, Reference } from 'langium';
+export type { AstNode, Reference } from 'langium';
 export * from './generated/ast';
 
 /**
@@ -37,32 +37,20 @@ export const BinaryExprOperatorPriority: Record<BinaryExpr['operator'], number> 
     '!': 5,
 };
 
-declare module './generated/ast' {
+declare module './ast' {
     interface AttributeArg {
         /**
          * Resolved attribute param declaration
          */
+        // @ts-ignore
         $resolvedParam?: AttributeParam;
-    }
-
-    interface DataModelField {
-        $inheritedFrom?: DataModel;
-    }
-
-    interface DataModelAttribute {
-        $inheritedFrom?: DataModel;
     }
 
     export interface DataModel {
         /**
-         * Indicates whether the model is already merged with the base types
-         */
-        $baseMerged?: boolean;
-
-        /**
          * All fields including those marked with `@ignore`
          */
-        $allFields?: DataModelField[];
+        $allFields?: DataField[];
     }
 }
 

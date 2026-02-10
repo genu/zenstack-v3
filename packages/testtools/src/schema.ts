@@ -1,437 +1,196 @@
-/* eslint-disable @typescript-eslint/no-var-requires */
-/* eslint-disable @typescript-eslint/no-explicit-any */
-import type { Model } from '@zenstackhq/language/ast';
-import {
-    DEFAULT_RUNTIME_LOAD_PATH,
-    type AuthUser,
-    type CrudContract,
-    type EnhancementKind,
-    type EnhancementOptions,
-} from '@zenstackhq/runtime';
-import type { PolicyDef } from '@zenstackhq/runtime/enhancements/node';
-import { getDMMF, type DMMF } from '@zenstackhq/sdk/prisma';
-import { execSync } from 'child_process';
-import * as fs from 'fs';
-import * as path from 'path';
-import tmp from 'tmp';
-import { loadDocument } from 'zenstack/cli/cli-util';
-import prismaPlugin from 'zenstack/plugins/prisma';
+import { invariant } from '@zenstackhq/common-helpers';
+import type { DataSourceProviderType, SchemaDef } from '@zenstackhq/schema';
+import { TsSchemaGenerator } from '@zenstackhq/sdk';
+import { execSync } from 'node:child_process';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { match } from 'ts-pattern';
+import { expect } from 'vitest';
+import { createTestProject } from './project';
+import { loadDocumentWithPlugins } from './utils';
 
-/**
- * Use it to represent multiple files in a single string like this
-   `schema.zmodel
-    import "user"
-    ${FILE_SPLITTER}user.zmodel
-    import "schema"
-    model User {
-    ...
-    }`
-*/
-export const FILE_SPLITTER = '#FILE_SPLITTER#';
-
-tmp.setGracefulCleanup();
-
-export type FullDbClientContract = CrudContract & {
-    $on(eventType: any, callback: (event: any) => void): void;
-    $use(cb: any): void;
-    $disconnect: () => Promise<void>;
-    $transaction: (input: ((tx: FullDbClientContract) => Promise<any>) | any[], options?: any) => Promise<any>;
-    $queryRaw: (query: TemplateStringsArray, ...args: any[]) => Promise<any>;
-    $executeRaw: (query: TemplateStringsArray, ...args: any[]) => Promise<number>;
-    $extends: (args: any) => FullDbClientContract;
-};
-
-export function run(cmd: string, env?: Record<string, string>, cwd?: string) {
-    try {
-        execSync(cmd, {
-            stdio: 'pipe',
-            encoding: 'utf-8',
-            env: { ...process.env, DO_NOT_TRACK: '1', ...env },
-            cwd,
-        });
-    } catch (err) {
-        console.error('Command failed:', cmd, err);
-        try {
-            execSync(cmd, {
-                stdio: 'inherit',
-                encoding: 'utf-8',
-                env: { ...process.env, DO_NOT_TRACK: '1', ...env },
-                cwd,
-            });
-        } catch {
-            // noop
-        }
-        throw err;
-    }
-}
-
-export function installPackage(pkg: string, dev = false) {
-    run(`npm install ${dev ? '-D' : ''} --no-audit --no-fund ${pkg}`);
-}
-
-export function normalizePath(p: string) {
-    return p ? p.split(path.sep).join(path.posix.sep) : p;
-}
-
-export function getWorkspaceRoot(start: string) {
-    let curr = normalizePath(start);
-    while (curr && curr !== '/') {
-        if (fs.existsSync(path.join(curr, 'pnpm-workspace.yaml'))) {
-            return curr;
-        } else {
-            curr = normalizePath(path.dirname(curr));
-        }
-    }
-    return undefined;
-}
-
-export function getWorkspaceNpmCacheFolder(start: string) {
-    const root = getWorkspaceRoot(start);
-    return root ? path.join(root, '.npmcache') : './.npmcache';
-}
-
-function makePrelude(options: SchemaLoadOptions) {
-    let dbUrl = options.dbUrl ?? (options.provider === 'postgresql' ? 'env("DATABASE_URL")' : 'file:./dev.db');
-
-    if (!dbUrl.includes('env(') && !dbUrl.startsWith("'") && !dbUrl.startsWith('"')) {
-        dbUrl = `'${dbUrl}'`;
-    }
-
-    return `
+function makePrelude(provider: DataSourceProviderType, dbUrl?: string) {
+    return match(provider)
+        .with('sqlite', () => {
+            return `
 datasource db {
-    provider = '${options.provider}'
-    url = ${dbUrl}
-}
-
-generator js {
-    provider = 'prisma-client-js'
-    ${
-        options.previewFeatures
-            ? `previewFeatures = ${JSON.stringify(options.previewFeatures)}`
-            : 'previewFeatures = ["strictUndefinedChecks"]'
-    }
-}
-
-plugin enhancer {
-    provider = '@core/enhancer'
-    ${options.preserveTsFiles ? 'preserveTsFiles = true' : ''}
-    ${options.generatePermissionChecker ? 'generatePermissionChecker = true' : ''}
-}
-
-plugin zod {
-    provider = '@core/zod'
-    ${options.preserveTsFiles ? 'preserveTsFiles = true' : ''}
-    modelOnly = ${!options.fullZod}
+    provider = 'sqlite'
+    url = '${dbUrl ?? 'file:./test.db'}'
 }
 `;
+        })
+        .with('postgresql', () => {
+            return `
+datasource db {
+    provider = 'postgresql'
+    url = '${dbUrl ?? 'postgres://postgres:postgres@localhost:5432/db'}'
 }
-
-export type SchemaLoadOptions = {
-    addPrelude?: boolean;
-    pushDb?: boolean;
-    fullZod?: boolean;
-    extraDependencies?: string[];
-    copyDependencies?: string[];
-    compile?: boolean;
-    customSchemaFilePath?: string;
-    output?: string;
-    logPrismaQuery?: boolean;
-    provider?: 'sqlite' | 'postgresql';
-    dbUrl?: string;
-    pulseApiKey?: string;
-    getPrismaOnly?: boolean;
-    enhancements?: EnhancementKind[];
-    enhanceOptions?: Partial<EnhancementOptions>;
-    extraSourceFiles?: { name: string; content: string }[];
-    projectDir?: string;
-    preserveTsFiles?: boolean;
-    generatePermissionChecker?: boolean;
-    previewFeatures?: string[];
-    prismaLoadPath?: string;
-    prismaClientOptions?: object;
-    generateNoCompile?: boolean;
-    dbFile?: string;
-};
-
-const defaultOptions: SchemaLoadOptions = {
-    addPrelude: true,
-    pushDb: true,
-    fullZod: false,
-    extraDependencies: [],
-    compile: false,
-    logPrismaQuery: false,
-    provider: 'sqlite',
-    preserveTsFiles: false,
-    generateNoCompile: false,
-};
-
-export async function loadSchemaFromFile(schemaFile: string, options?: SchemaLoadOptions) {
-    const content = fs.readFileSync(schemaFile, { encoding: 'utf-8' });
-    return loadSchema(content, options);
-}
-
-export async function loadSchema(schema: string, options?: SchemaLoadOptions) {
-    const { projectDir, options: mergedOptions } = createProjectAndCompile(schema, options);
-
-    const prismaLoadPath =
-        mergedOptions?.prismaLoadPath && mergedOptions.prismaLoadPath !== '@prisma/client'
-            ? path.isAbsolute(mergedOptions.prismaLoadPath)
-                ? mergedOptions.prismaLoadPath
-                : path.join(projectDir, mergedOptions.prismaLoadPath)
-            : path.join(projectDir, 'node_modules/.prisma/client');
-    const prismaModule = require(prismaLoadPath);
-    const PrismaClient = prismaModule.PrismaClient;
-
-    let clientOptions: object = { log: ['info', 'warn', 'error'] };
-    if (mergedOptions?.prismaClientOptions) {
-        clientOptions = { ...clientOptions, ...mergedOptions.prismaClientOptions };
-    }
-    let prisma = new PrismaClient(clientOptions);
-    // https://github.com/prisma/prisma/issues/18292
-    prisma[Symbol.for('nodejs.util.inspect.custom')] = 'PrismaClient';
-
-    if (mergedOptions.pulseApiKey) {
-        const withPulse = loadModule('@prisma/extension-pulse/node', projectDir).withPulse;
-        prisma = prisma.$extends(withPulse({ apiKey: mergedOptions.pulseApiKey }));
-    }
-
-    if (mergedOptions?.getPrismaOnly) {
-        return {
-            prisma,
-            prismaModule,
-            projectDir,
-            enhance: undefined as any,
-            enhanceRaw: undefined as any,
-            policy: undefined as unknown as PolicyDef,
-            modelMeta: undefined as any,
-            zodSchemas: undefined as any,
-        };
-    }
-
-    const outputPath = mergedOptions.output
-        ? path.isAbsolute(mergedOptions.output)
-            ? mergedOptions.output
-            : path.join(projectDir, mergedOptions.output)
-        : path.join(projectDir, 'node_modules', DEFAULT_RUNTIME_LOAD_PATH);
-
-    const policy: PolicyDef = require(path.join(outputPath, 'policy')).default;
-    const modelMeta = require(path.join(outputPath, 'model-meta')).default;
-
-    let zodSchemas: any;
-    try {
-        zodSchemas = require(path.join(outputPath, 'zod'));
-    } catch {
-        /* noop */
-    }
-
-    const enhance = require(path.join(outputPath, 'enhance')).enhance;
-
-    return {
-        projectDir: projectDir,
-        prisma,
-        enhance: (user?: AuthUser, options?: EnhancementOptions): FullDbClientContract =>
-            enhance(
-                prisma,
-                { user },
-                {
-                    logPrismaQuery: mergedOptions.logPrismaQuery,
-                    transactionTimeout: 1000000,
-                    kinds: mergedOptions.enhancements,
-                    ...(options ?? mergedOptions.enhanceOptions),
-                }
-            ),
-        enhanceRaw: enhance,
-        policy,
-        modelMeta,
-        zodSchemas,
-        prismaModule,
-    };
-}
-
-export function createProjectAndCompile(schema: string, options: SchemaLoadOptions | undefined) {
-    const opt = { ...defaultOptions, ...options };
-
-    let projectDir = opt.projectDir;
-    if (!projectDir) {
-        const r = tmp.dirSync({ unsafeCleanup: true });
-        projectDir = r.name;
-    }
-
-    const workspaceRoot = getWorkspaceRoot(__dirname);
-
-    if (!workspaceRoot) {
-        throw new Error('Could not find workspace root');
-    }
-
-    console.log('Workdir:', projectDir);
-    process.chdir(projectDir);
-
-    // copy project structure from scaffold (prepared by test-setup.ts)
-    fs.cpSync(path.join(workspaceRoot, '.test/scaffold'), projectDir, { recursive: true, force: true });
-
-    // install local deps
-    const localInstallDeps = [
-        'packages/schema/dist',
-        'packages/runtime/dist',
-        'packages/plugins/swr/dist',
-        'packages/plugins/trpc/dist',
-        'packages/plugins/openapi/dist',
-    ];
-
-    run(`npm i --no-audit --no-fund ${localInstallDeps.map((d) => path.join(workspaceRoot, d)).join(' ')}`);
-
-    let zmodelPath = path.join(projectDir, 'schema.zmodel');
-
-    const files = schema.split(FILE_SPLITTER);
-
-    // Use this one to replace $projectRoot placeholder in the schema file
-    const normalizedProjectRoot = normalizePath(projectDir);
-
-    if (files.length > 1) {
-        // multiple files
-        files.forEach((file, index) => {
-            //first line is the file name
-            const firstLine = file.indexOf('\n');
-            const fileName = file.substring(0, firstLine).trim();
-            let fileContent = file.substring(firstLine + 1);
-            if (index === 0) {
-                // The first file is the main schema file
-                zmodelPath = path.join(projectDir, fileName);
-                if (opt.addPrelude) {
-                    // plugin need to be added after import statement
-                    fileContent = `${fileContent}\n${makePrelude(opt)}`;
-                }
-            }
-
-            fileContent = fileContent.replaceAll('$projectRoot', normalizedProjectRoot);
-            const filePath = path.join(projectDir, fileName);
-            fs.writeFileSync(filePath, fileContent);
-        });
-    } else {
-        schema = schema.replaceAll('$projectRoot', normalizedProjectRoot);
-        const content = opt.addPrelude ? `${makePrelude(opt)}\n${schema}` : schema;
-        if (opt.customSchemaFilePath) {
-            zmodelPath = path.join(projectDir, opt.customSchemaFilePath);
-            fs.mkdirSync(path.dirname(zmodelPath), { recursive: true });
-            fs.writeFileSync(zmodelPath, content);
-        } else {
-            fs.writeFileSync('schema.zmodel', content);
-        }
-    }
-
-    const outputArg = opt.output ? ` --output ${opt.output}` : '';
-    let otherArgs = '';
-    if (opt.generateNoCompile) {
-        otherArgs = ' --no-compile';
-    }
-
-    if (opt.customSchemaFilePath) {
-        run(
-            `npx zenstack generate --no-version-check --schema ${zmodelPath} --no-dependency-check${outputArg}${otherArgs}`,
-            {
-                NODE_PATH: './node_modules',
-            }
-        );
-    } else {
-        run(`npx zenstack generate --no-version-check --no-dependency-check${outputArg}${otherArgs}`, {
-            NODE_PATH: './node_modules',
-        });
-    }
-
-    if (opt.dbFile) {
-        fs.cpSync(opt.dbFile, path.join(projectDir, 'prisma/dev.db'));
-    }
-    else if (opt.pushDb) {
-        run('npx prisma db push --skip-generate --accept-data-loss');
-    }
-
-    if (opt.pulseApiKey) {
-        opt.extraDependencies?.push('@prisma/extension-pulse');
-    }
-
-    if (opt.extraDependencies) {
-        console.log(`Installing dependency ${opt.extraDependencies.join(' ')}`);
-        installPackage(opt.extraDependencies.join(' '));
-    }
-
-    opt.copyDependencies?.forEach((dep) => {
-        const pkgJson = JSON.parse(fs.readFileSync(path.join(dep, 'package.json'), { encoding: 'utf-8' }));
-        fs.cpSync(dep, path.join(projectDir, 'node_modules', pkgJson.name), { recursive: true, force: true });
-    });
-
-    opt.extraSourceFiles?.forEach(({ name, content }) => {
-        fs.writeFileSync(path.join(projectDir, name), content);
-    });
-
-    if (opt.compile || opt.extraSourceFiles) {
-        console.log('Compiling...');
-
-        // add generated '.zenstack/zod' folder to typescript's search path,
-        // so that it can be resolved from symbolic-linked files
-
-        const tsconfig: any = {
-            compilerOptions: {
-                target: 'es2016',
-                module: 'commonjs',
-                esModuleInterop: true,
-                forceConsistentCasingInFileNames: true,
-                strict: true,
-                skipLibCheck: true,
-            },
-        };
-
-        tsconfig.compilerOptions.paths = {
-            '.zenstack/zod/input': ['./node_modules/.zenstack/zod/input/index.d.ts'],
-            '.zenstack/models': ['./node_modules/.zenstack/models.d.ts'],
-        };
-        tsconfig.include = ['**/*.ts'];
-        tsconfig.exclude = ['node_modules'];
-        fs.writeFileSync(path.join(projectDir, './tsconfig.json'), JSON.stringify(tsconfig, null, 2));
-        run('npx tsc --project tsconfig.json');
-    }
-    return { projectDir, options: opt };
-}
-
-/**
- * Load ZModel and Prisma DMM from a string without creating a NPM project.
- * @param content
- * @returns
- */
-export async function loadZModelAndDmmf(
-    content: string
-): Promise<{ model: Model; dmmf: DMMF.Document; modelFile: string }> {
-    const prelude = `
-    datasource db {
-        provider = 'postgresql'
-        url = env('DATABASE_URL')
-    }
 `;
+        })
+        .with('mysql', () => {
+            return `
+datasource db {
+    provider = 'mysql'
+    url = '${dbUrl ?? 'mysql://root:mysql@localhost:3306/db'}'
+}
+`;
+        })
+        .exhaustive();
+}
 
-    const { name: modelFile } = tmp.fileSync({ postfix: '.zmodel' });
-    fs.writeFileSync(modelFile, `${prelude}\n${content}`);
+function replacePlaceholders(
+    schemaText: string,
+    provider: 'sqlite' | 'postgresql' | 'mysql',
+    dbUrl: string | undefined,
+) {
+    const url =
+        dbUrl ??
+        (provider === 'sqlite'
+            ? 'file:./test.db'
+            : provider === 'mysql'
+              ? 'mysql://root:mysql@localhost:3306/db'
+              : 'postgres://postgres:postgres@localhost:5432/db');
+    return schemaText.replace(/\$DB_URL/g, url).replace(/\$PROVIDER/g, provider);
+}
 
-    const model = await loadDocument(modelFile);
+export async function generateTsSchema(
+    schemaText: string,
+    provider: DataSourceProviderType = 'sqlite',
+    dbUrl?: string,
+    extraSourceFiles?: Record<string, string>,
+    withLiteSchema?: boolean,
+    extraZModelFiles?: Record<string, string>,
+) {
+    const workDir = createTestProject();
 
-    const { name: prismaFile } = tmp.fileSync({ postfix: '.prisma' });
-    await prismaPlugin(
-        model,
-        {
-            provider: '@core/plugin',
-            schemaPath: modelFile,
-            output: prismaFile,
-            generateClient: false,
-        },
-        undefined,
-        undefined
+    const zmodelPath = path.join(workDir, 'schema.zmodel');
+    const noPrelude = schemaText.includes('datasource ');
+    fs.writeFileSync(
+        zmodelPath,
+        `${noPrelude ? '' : makePrelude(provider, dbUrl)}\n\n${replacePlaceholders(schemaText, provider, dbUrl)}`,
     );
 
-    const prismaContent = fs.readFileSync(prismaFile, { encoding: 'utf-8' });
+    // write extra ZModel files before loading the schema
+    if (extraZModelFiles) {
+        for (const [fileName, content] of Object.entries(extraZModelFiles)) {
+            let name = fileName;
+            if (!name.endsWith('.zmodel')) {
+                name += '.zmodel';
+            }
+            const filePath = path.join(workDir, name);
+            fs.mkdirSync(path.dirname(filePath), { recursive: true });
+            fs.writeFileSync(filePath, content);
+        }
+    }
 
-    const dmmf = await getDMMF({ datamodel: prismaContent });
-    return { model, dmmf, modelFile };
+    const result = await loadDocumentWithPlugins(zmodelPath);
+    if (!result.success) {
+        throw new Error(`Failed to load schema from ${zmodelPath}: ${result.errors}`);
+    }
+
+    const generator = new TsSchemaGenerator();
+    await generator.generate(result.model, { outDir: workDir, lite: withLiteSchema });
+
+    if (extraSourceFiles) {
+        for (const [fileName, content] of Object.entries(extraSourceFiles)) {
+            const filePath = path.resolve(workDir, !fileName.endsWith('.ts') ? `${fileName}.ts` : fileName);
+            fs.mkdirSync(path.dirname(filePath), { recursive: true });
+            fs.writeFileSync(filePath, content);
+        }
+    }
+
+    // compile the generated TS schema
+    return { ...(await compileAndLoad(workDir)), model: result.model };
 }
 
-function loadModule(module: string, basePath: string): any {
-    const modulePath = require.resolve(module, { paths: [basePath] });
-    return require(modulePath);
+async function compileAndLoad(workDir: string) {
+    execSync('npx tsc', {
+        cwd: workDir,
+        stdio: 'inherit',
+    });
+
+    // load the schema module
+    const module = await import(path.join(workDir, 'schema.js'));
+
+    let moduleLite: any;
+    try {
+        moduleLite = await import(path.join(workDir, 'schema-lite.js'));
+    } catch {
+        // ignore
+    }
+    return { workDir, schema: module.schema as SchemaDef, schemaLite: moduleLite?.schema as SchemaDef | undefined };
+}
+
+export function generateTsSchemaFromFile(filePath: string) {
+    const schemaText = fs.readFileSync(filePath, 'utf8');
+    return generateTsSchema(schemaText);
+}
+
+export async function generateTsSchemaInPlace(schemaPath: string) {
+    const workDir = path.dirname(schemaPath);
+    const result = await loadDocumentWithPlugins(schemaPath);
+    if (!result.success) {
+        throw new Error(`Failed to load schema from ${schemaPath}: ${result.errors}`);
+    }
+    const generator = new TsSchemaGenerator();
+    await generator.generate(result.model, { outDir: workDir });
+    return compileAndLoad(workDir);
+}
+
+export async function loadSchema(schema: string, additionalSchemas?: Record<string, string>) {
+    if (!schema.includes('datasource ')) {
+        schema = `${makePrelude('sqlite')}\n\n${schema}`;
+    }
+
+    // create a temp folder
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zenstack-schema'));
+
+    // create a temp file
+    const tempFile = path.join(tempDir, `schema.zmodel`);
+    fs.writeFileSync(tempFile, schema);
+
+    if (additionalSchemas) {
+        for (const [fileName, content] of Object.entries(additionalSchemas)) {
+            let name = fileName;
+            if (!name.endsWith('.zmodel')) {
+                name += '.zmodel';
+            }
+            const filePath = path.join(tempDir, name);
+            fs.writeFileSync(filePath, content);
+        }
+    }
+
+    const r = await loadDocumentWithPlugins(tempFile);
+    expect(r).toSatisfy(
+        (r) => r.success,
+        `Failed to load schema: ${(r as any).errors?.map((e: any) => e.toString()).join(', ')}`,
+    );
+    invariant(r.success);
+    return r.model;
+}
+
+export async function loadSchemaWithError(schema: string, error: string | RegExp) {
+    if (!schema.includes('datasource ')) {
+        schema = `${makePrelude('sqlite')}\n\n${schema}`;
+    }
+
+    // create a temp file
+    const tempFile = path.join(os.tmpdir(), `zenstack-schema-${crypto.randomUUID()}.zmodel`);
+    fs.writeFileSync(tempFile, schema);
+    const r = await loadDocumentWithPlugins(tempFile);
+    expect(r.success).toBe(false);
+    invariant(!r.success);
+    if (typeof error === 'string') {
+        expect(r).toSatisfy(
+            (r) => r.errors.some((e: any) => e.toString().toLowerCase().includes(error.toLowerCase())),
+            `Expected error message to include "${error}" but got: ${r.errors.map((e: any) => e.toString()).join(', ')}`,
+        );
+    } else {
+        expect(r).toSatisfy(
+            (r) => r.errors.some((e: any) => error.test(e)),
+            `Expected error message to match "${error}" but got: ${r.errors.map((e: any) => e.toString()).join(', ')}`,
+        );
+    }
 }

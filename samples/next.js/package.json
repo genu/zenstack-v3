@@ -1,0 +1,36 @@
+{
+    "name": "next.js",
+    "private": true,
+    "scripts": {
+        "generate": "zen generate --lite",
+        "db:init": "pnpm generate && zen db push && npx tsx zenstack/seed.ts",
+        "dev": "next dev --port 3301",
+        "build": "pnpm generate && next build",
+        "start": "next start",
+        "lint": "eslint"
+    },
+    "dependencies": {
+        "@tanstack/react-query": "catalog:",
+        "@zenstackhq/orm": "workspace:*",
+        "@zenstackhq/server": "workspace:*",
+        "@zenstackhq/tanstack-query": "workspace:*",
+        "better-sqlite3": "catalog:",
+        "kysely": "catalog:",
+        "lorem-ipsum": "^2.0.8",
+        "next": "catalog:",
+        "react": "catalog:",
+        "react-dom": "catalog:"
+    },
+    "devDependencies": {
+        "@tailwindcss/postcss": "^4",
+        "@types/better-sqlite3": "catalog:",
+        "@types/node": "catalog:",
+        "@types/react": "catalog:",
+        "@types/react-dom": "catalog:",
+        "@zenstackhq/cli": "workspace:*",
+        "eslint": "^9",
+        "eslint-config-next": "16.0.1",
+        "tailwindcss": "^4",
+        "typescript": "catalog:"
+    }
+}

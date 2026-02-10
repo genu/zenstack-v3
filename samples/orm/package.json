@@ -1,0 +1,30 @@
+{
+    "name": "sample-blog",
+    "version": "3.3.3",
+    "description": "",
+    "main": "index.js",
+    "private": true,
+    "scripts": {
+        "generate": "zen generate",
+        "db:push": "zen db push",
+        "db:migrate": "zen migrate dev",
+        "build": "pnpm generate && tsc --noEmit",
+        "dev": "tsx main.ts"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "MIT",
+    "dependencies": {
+        "@zenstackhq/orm": "workspace:*",
+        "@zenstackhq/plugin-policy": "workspace:*",
+        "better-sqlite3": "catalog:",
+        "kysely": "catalog:",
+        "zod": "catalog:"
+    },
+    "devDependencies": {
+        "@types/better-sqlite3": "catalog:",
+        "prisma": "catalog:",
+        "@zenstackhq/cli": "workspace:*",
+        "@zenstackhq/typescript-config": "workspace:*"
+    }
+}

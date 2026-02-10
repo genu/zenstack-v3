@@ -11,7 +11,7 @@ ModelImport:
     'import' path=STRING  ';'?;
 
 AbstractDeclaration:
-    DataSource | GeneratorDecl| Plugin | DataModel | TypeDef | Enum | FunctionDecl | Attribute;
+    DataSource | GeneratorDecl| Plugin | DataModel | TypeDef | Enum | FunctionDecl | Attribute | Procedure;
 
 // datasource
 DataSource:
@@ -66,7 +66,8 @@ ConfigArrayExpr:
 ConfigExpr:
     LiteralExpr | InvocationExpr | ConfigArrayExpr;
 
-type ReferenceTarget = FunctionParam | DataModelField | TypeDefField | EnumField;
+type ReferenceTarget = FunctionParam | DataField | EnumField | CollectionPredicateBinding;
+
 ThisExpr:
     value='this';
 
@@ -94,7 +95,7 @@ FieldInitializer:
 InvocationExpr:
     function=[FunctionDecl] '(' ArgumentList? ')';
 
-type MemberAccessTarget = DataModelField | TypeDefField;
+type MemberAccessTarget = DataField;
 
 MemberAccessExpr infers Expression:
     PrimaryExpr (
@@ -108,12 +109,16 @@ UnaryExpr:
 // binary operator precedence follow Javascript's rules:
 // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Operators/Operator_Precedence#table
 
+// TODO: promote CollectionPredicateExpr to a first-class expression type
 CollectionPredicateExpr infers Expression:
     MemberAccessExpr (
         {infer BinaryExpr.left=current}
         operator=('?'|'!'|'^')
-        '[' right=Expression ']'
+        '[' (binding=CollectionPredicateBinding ',')? right=Expression ']'
     )*;
+
+CollectionPredicateBinding:
+    name=RegularID;
 
 InExpr infers Expression:
     CollectionPredicateExpr (
@@ -164,40 +169,36 @@ Argument:
 DataModel:
     (comments+=TRIPLE_SLASH_COMMENT)*
     (
-        ((isAbstract?='abstract')? 'model' name=RegularID
-            ('extends' superTypes+=[DataModel] (',' superTypes+=[DataModel])*)?) |
+        ('model' name=RegularID (WithClause | ExtendsClause | (ExtendsClause WithClause) | (WithClause ExtendsClause))?) |
         ((isView?='view') name=RegularID)
     )
     '{' (
-        fields+=DataModelField
+        fields+=DataField
             | attributes+=DataModelAttribute
         )*
     '}';
 
-DataModelField:
-    (comments+=TRIPLE_SLASH_COMMENT)*
-    name=RegularIDWithTypeNames type=DataModelFieldType (attributes+=DataModelFieldAttribute)*;
+fragment WithClause:
+    'with' mixins+=[TypeDef] (','? mixins+=[TypeDef])*;
 
-DataModelFieldType:
+fragment ExtendsClause:
+    'extends' baseModel=[DataModel];
+
+DataField:
+    (comments+=TRIPLE_SLASH_COMMENT)*
+    name=RegularIDWithTypeNames type=DataFieldType (attributes+=DataFieldAttribute)*;
+
+DataFieldType:
     (type=BuiltinType | unsupported=UnsupportedFieldType | reference=[TypeDeclaration:RegularID]) (array?='[' ']')? (optional?='?')?;
 
-// TODO: unify TypeDef and abstract DataModel
 TypeDef:
     (comments+=TRIPLE_SLASH_COMMENT)*
-    'type' name=RegularID '{' (
-           fields+=TypeDefField |
+    'type' name=RegularID WithClause?
+    '{' (
+           fields+=DataField |
            attributes+=DataModelAttribute
         )*
     '}';
-
-type TypeDefFieldTypes = TypeDef | Enum;
-
-TypeDefField:
-    (comments+=TRIPLE_SLASH_COMMENT)*
-    name=RegularIDWithTypeNames type=TypeDefFieldType (attributes+=DataModelFieldAttribute)*;
-
-TypeDefFieldType:
-    (type=BuiltinType | reference=[TypeDefFieldTypes:RegularID]) (array?='[' ']')? (optional?='?')?;
 
 UnsupportedFieldType:
     'Unsupported' '(' (value=LiteralExpr) ')';
@@ -213,7 +214,7 @@ Enum:
 
 EnumField:
     (comments+=TRIPLE_SLASH_COMMENT)*
-    name=RegularIDWithTypeNames (attributes+=DataModelFieldAttribute)*;
+    name=RegularIDWithTypeNames (attributes+=DataFieldAttribute)*;
 
 // function
 FunctionDecl:
@@ -225,13 +226,19 @@ FunctionParam:
 FunctionParamType:
     (type=ExpressionType | reference=[TypeDeclaration:RegularID]) (array?='[' ']')?;
 
+ProcedureParam:
+    TRIPLE_SLASH_COMMENT* name=RegularID ':' type=FunctionParamType (optional?='?')?;
+
+Procedure:
+    TRIPLE_SLASH_COMMENT* (mutation?='mutation')? 'procedure' name=RegularID '(' (params+=ProcedureParam (',' params+=ProcedureParam)*)? ')' ':' returnType=FunctionParamType (attributes+=InternalAttribute)*;
+
 // https://github.com/langium/langium/discussions/1012
 RegularID returns string:
     // include keywords that we'd like to work as ID in most places
     ID | 'model' | 'enum' | 'attribute' | 'datasource' | 'plugin' | 'abstract' | 'in' | 'view' | 'import' | 'type';
 
 RegularIDWithTypeNames returns string:
-    RegularID | 'String' | 'Boolean' | 'Int' | 'BigInt' | 'Float' | 'Decimal' | 'DateTime' | 'Json' | 'Bytes' | 'Null' | 'Object' | 'Any' | 'Unsupported';
+    RegularID | 'String' | 'Boolean' | 'Int' | 'BigInt' | 'Float' | 'Decimal' | 'DateTime' | 'Json' | 'Bytes' | 'Null' | 'Object' | 'Any' | 'Void' | 'Unsupported';
 
 // attribute
 Attribute:
@@ -246,7 +253,7 @@ AttributeParamType:
     (type=(ExpressionType | 'FieldReference' | 'TransitiveFieldReference' | 'ContextType') | reference=[TypeDeclaration:RegularID]) (array?='[' ']')? (optional?='?')?;
 
 type TypeDeclaration = DataModel | TypeDef | Enum;
-DataModelFieldAttribute:
+DataFieldAttribute:
     decl=[Attribute:FIELD_ATTRIBUTE_NAME] ('(' AttributeArgList? ')')?;
 
 // TODO: need rename since it's for both DataModel and TypeDef
@@ -263,7 +270,7 @@ AttributeArg:
     (name=RegularID ':')? value=Expression;
 
 ExpressionType returns string:
-    'String' | 'Int' | 'Float' | 'Boolean' | 'DateTime' | 'Null' | 'Object' | 'Any' | 'Unsupported';
+    'String' | 'Int' | 'Float' | 'Boolean' | 'BigInt' | 'Decimal' | 'DateTime' | 'Json' | 'Bytes' | 'Null' | 'Object' | 'Any' | 'Void' | 'Undefined' | 'Unsupported';
 
 BuiltinType returns string:
     'String' | 'Boolean' | 'Int' | 'BigInt' | 'Float' | 'Decimal' | 'DateTime' | 'Json' | 'Bytes';

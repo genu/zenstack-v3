@@ -1,53 +1,53 @@
 {
     "name": "@zenstackhq/sdk",
-    "version": "2.22.2",
-    "description": "ZenStack plugin development SDK",
-    "main": "index.js",
+    "version": "3.3.3",
+    "description": "ZenStack SDK",
+    "type": "module",
     "scripts": {
-        "clean": "rimraf dist",
+        "build": "tsc --noEmit && tsup-node",
+        "watch": "tsup-node --watch",
         "lint": "eslint src --ext ts",
-        "build": "pnpm lint --max-warnings=0 && pnpm clean && tsc && copyfiles ./package.json ./LICENSE ./README.md dist && pnpm pack dist --pack-destination ../../../.build",
-        "watch": "tsc --watch",
-        "prepublishOnly": "pnpm build"
-    },
-    "publishConfig": {
-        "directory": "dist",
-        "linkDirectory": true
+        "pack": "pnpm pack"
     },
     "keywords": [],
-    "author": "",
+    "author": "ZenStack Team",
     "license": "MIT",
-    "dependencies": {
-        "@prisma/generator-helper": "6.19.x",
-        "@prisma/internals": "6.19.x",
-        "@prisma/internals-v7": "npm:@prisma/internals@7",
-        "@zenstackhq/language": "workspace:*",
-        "@zenstackhq/runtime": "workspace:*",
-        "langium": "1.3.1",
-        "semver": "^7.5.2",
-        "ts-morph": "catalog:",
-        "ts-pattern": "^4.3.0"
-    },
-    "devDependencies": {
-        "@types/semver": "^7.3.13"
-    },
+    "files": [
+        "dist"
+    ],
     "exports": {
         ".": {
-            "types": "./index.d.ts",
-            "default": "./index.js"
+            "import": {
+                "types": "./dist/index.d.ts",
+                "default": "./dist/index.js"
+            },
+            "require": {
+                "types": "./dist/index.d.cts",
+                "default": "./dist/index.cjs"
+            }
         },
         "./ast": {
-            "types": "./ast.d.ts",
-            "default": "./ast.js"
-        },
-        "./prisma": {
-            "types": "./prisma.d.ts",
-            "default": "./prisma.js"
-        },
-        "./dmmf-helpers": {
-            "types": "./dmmf-helpers/index.d.ts",
-            "default": "./dmmf-helpers/index.js"
-        },
-        "./package.json": "./package.json"
+            "import": {
+                "types": "./dist/ast.d.ts",
+                "default": "./dist/ast.js"
+            },
+            "require": {
+                "types": "./dist/ast.d.cts",
+                "default": "./dist/ast.cjs"
+            }
+        }
+    },
+    "dependencies": {
+        "@zenstackhq/language": "workspace:*",
+        "@zenstackhq/common-helpers": "workspace:*",
+        "langium": "catalog:",
+        "ts-pattern": "catalog:",
+        "typescript": "catalog:"
+    },
+    "devDependencies": {
+        "@zenstackhq/eslint-config": "workspace:*",
+        "@zenstackhq/typescript-config": "workspace:*",
+        "decimal.js": "catalog:",
+        "kysely": "catalog:"
     }
 }

@@ -1,0 +1,42 @@
+{
+    "name": "@zenstackhq/zod",
+    "version": "3.3.3",
+    "description": "",
+    "type": "module",
+    "main": "index.js",
+    "private": true,
+    "scripts": {
+        "build": "tsc --noEmit && tsup-node",
+        "lint": "eslint src --ext ts"
+    },
+    "keywords": [],
+    "files": [
+        "dist"
+    ],
+    "author": "",
+    "license": "MIT",
+    "exports": {
+        ".": {
+            "import": {
+                "types": "./dist/index.d.ts",
+                "default": "./dist/index.js"
+            },
+            "require": {
+                "types": "./dist/index.d.cts",
+                "default": "./dist/index.cjs"
+            }
+        }
+    },
+    "dependencies": {
+        "@zenstackhq/orm": "workspace:*",
+        "ts-pattern": "catalog:"
+    },
+    "devDependencies": {
+        "@zenstackhq/eslint-config": "workspace:*",
+        "@zenstackhq/typescript-config": "workspace:*",
+        "zod": "^4.1.0"
+    },
+    "peerDependencies": {
+        "zod": "catalog:"
+    }
+}

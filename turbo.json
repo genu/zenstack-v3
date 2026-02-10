@@ -1,0 +1,23 @@
+{
+    "$schema": "https://turbo.build/schema.json",
+    "tasks": {
+        "build": {
+            "dependsOn": ["^build"],
+            "inputs": ["src/**", "samples/**", "zenstack/*.zmodel"],
+            "outputs": ["dist/**"]
+        },
+        "watch": {
+            "dependsOn": ["^build"],
+            "inputs": ["src/**", "zenstack/*.zmodel"],
+            "outputs": []
+        },
+        "lint": {
+            "dependsOn": ["^lint"]
+        },
+        "test": {
+            "dependsOn": ["build"],
+            "cache": false
+        }
+    },
+    "globalPassThroughEnv": ["TEST_DB_PROVIDER"]
+}
