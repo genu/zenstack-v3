@@ -1218,8 +1218,10 @@ export abstract class BaseOperationHandler<Schema extends SchemaDef> {
             );
             // only fields not consumed by base update will be used for this model
             finalData = baseUpdateResult.remainingFields;
-            // base update may change entity ids, update the filter
-            combinedWhere = baseUpdateResult.baseEntity;
+            // trim to id fields only to avoid "missing FROM-clause" errors in the child update
+            combinedWhere = baseUpdateResult.baseEntity
+                ? getIdValues(this.schema, modelDef.baseModel!, baseUpdateResult.baseEntity)
+                : baseUpdateResult.baseEntity;
 
             // update this entity with fields in updated base
             if (baseUpdateResult.baseEntity) {
